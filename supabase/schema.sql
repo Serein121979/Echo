@@ -31,6 +31,19 @@ alter table public.notes
 alter table public.notes
   add column if not exists updated_at timestamptz not null default timezone('utc', now());
 
+alter table public.notes
+  add column if not exists deleted_at timestamptz;
+
+alter table public.notes
+  add column if not exists fts tsvector
+  generated always as (to_tsvector('simple', coalesce(content, ''))) stored;
+
+create index if not exists notes_deleted_at_idx
+  on public.notes (deleted_at);
+
+create index if not exists notes_fts_idx
+  on public.notes using gin (fts);
+
 create table if not exists public.note_tags (
   note_id uuid not null references public.notes(id) on delete cascade,
   tag_id uuid not null references public.tags(id) on delete cascade,

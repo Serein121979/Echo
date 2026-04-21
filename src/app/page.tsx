@@ -1,10 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { supabase } from "@/utils/supabase/client";
+import { getSupabaseClient, supabaseConfigError } from "@/utils/supabase/client";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
-import { Folder, Pencil, Plus, Send, Tag, Trash2, X } from "lucide-react";
+import { Folder, Pencil, Plus, Search, Send, Tag, Trash2, X } from "lucide-react";
 
 type FolderItem = {
   id: string;
@@ -22,6 +22,7 @@ type NoteRow = {
   content: string;
   created_at: string;
   folder_id?: string | null;
+  deleted_at?: string | null;
 };
 
 type NoteTagRow = {
@@ -49,6 +50,13 @@ const TAG_COLORS = {
   电话: "#0f766e",
 } as const;
 const AUTO_TAG_NAMES = Object.keys(TAG_COLORS);
+
+type FetchNotesResult = {
+  data: NoteRow[];
+  error: { code?: string; message: string } | null;
+  supportsSoftDelete: boolean;
+  supportsServerSearch: boolean;
+};
 
 function isMissingTableError(code?: string) {
   return code === "42P01";
@@ -104,23 +112,112 @@ function inferAutoTags(content: string) {
   return Array.from(next);
 }
 
-async function fetchNotes() {
-  const nextShape = await supabase
+function buildNotesQuery(
+  supabase: NonNullable<ReturnType<typeof getSupabaseClient>>,
+  selectClause: string,
+  searchQuery: string,
+  enableServerSearch: boolean,
+) {
+  let query = supabase.from("notes").select(selectClause).order("created_at", { ascending: true });
+
+  if (selectClause.includes("deleted_at")) {
+    query = query.is("deleted_at", null);
+  }
+
+  if (enableServerSearch && searchQuery) {
+    query = query.textSearch("fts", searchQuery, { config: "simple", type: "plain" });
+  }
+
+  return query;
+}
+
+function asNoteRows(data: unknown) {
+  return (data ?? []) as NoteRow[];
+}
+
+async function fetchNotes(searchQuery: string): Promise<FetchNotesResult> {
+  const supabase = getSupabaseClient();
+
+  if (!supabase) {
+    return {
+      data: [],
+      error: { message: supabaseConfigError ?? "Supabase 客户端初始化失败" },
+      supportsSoftDelete: false,
+      supportsServerSearch: false,
+    };
+  }
+
+  const normalizedSearch = searchQuery.trim();
+  const latestShape = await buildNotesQuery(
+    supabase,
+    "id, content, created_at, folder_id, deleted_at",
+    normalizedSearch,
+    normalizedSearch.length > 0,
+  );
+
+  if (!latestShape.error) {
+    return {
+      data: asNoteRows(latestShape.data),
+      error: null,
+      supportsSoftDelete: true,
+      supportsServerSearch: true,
+    };
+  }
+
+  if (!isMissingColumnError(latestShape.error.code)) {
+    return {
+      data: [],
+      error: latestShape.error,
+      supportsSoftDelete: false,
+      supportsServerSearch: false,
+    };
+  }
+
+  const withoutSearchVector = await buildNotesQuery(
+    supabase,
+    "id, content, created_at, folder_id, deleted_at",
+    normalizedSearch,
+    false,
+  );
+
+  if (!withoutSearchVector.error) {
+    return {
+      data: asNoteRows(withoutSearchVector.data),
+      error: null,
+      supportsSoftDelete: true,
+      supportsServerSearch: false,
+    };
+  }
+
+  if (!isMissingColumnError(withoutSearchVector.error.code)) {
+    return {
+      data: [],
+      error: withoutSearchVector.error,
+      supportsSoftDelete: false,
+      supportsServerSearch: false,
+    };
+  }
+
+  const folderShape = await supabase
     .from("notes")
     .select("id, content, created_at, folder_id")
     .order("created_at", { ascending: true });
 
-  if (!nextShape.error) {
+  if (!folderShape.error) {
     return {
-      data: (nextShape.data ?? []) as NoteRow[],
+      data: asNoteRows(folderShape.data),
       error: null,
+      supportsSoftDelete: false,
+      supportsServerSearch: false,
     };
   }
 
-  if (!isMissingColumnError(nextShape.error.code)) {
+  if (!isMissingColumnError(folderShape.error.code)) {
     return {
-      data: [] as NoteRow[],
-      error: nextShape.error,
+      data: [],
+      error: folderShape.error,
+      supportsSoftDelete: false,
+      supportsServerSearch: false,
     };
   }
 
@@ -130,15 +227,27 @@ async function fetchNotes() {
     .order("created_at", { ascending: true });
 
   return {
-    data: ((legacyShape.data ?? []) as NoteRow[]).map((note) => ({
+    data: asNoteRows(legacyShape.data).map((note) => ({
       ...note,
       folder_id: null,
     })),
     error: legacyShape.error,
+    supportsSoftDelete: false,
+    supportsServerSearch: false,
   };
 }
 
 async function fetchFolders() {
+  const supabase = getSupabaseClient();
+
+  if (!supabase) {
+    return {
+      data: [] as FolderItem[],
+      error: { message: supabaseConfigError ?? "Supabase 客户端初始化失败" },
+      enabled: false,
+    };
+  }
+
   const result = await supabase
     .from("folders")
     .select("id, name")
@@ -160,6 +269,16 @@ async function fetchFolders() {
 }
 
 async function fetchNoteTags() {
+  const supabase = getSupabaseClient();
+
+  if (!supabase) {
+    return {
+      data: [] as NoteTagRow[],
+      error: { message: supabaseConfigError ?? "Supabase 客户端初始化失败" },
+      enabled: false,
+    };
+  }
+
   const result = await supabase
     .from("note_tags")
     .select("note_id, tag:tags(id, name, color)");
@@ -180,6 +299,16 @@ async function fetchNoteTags() {
 }
 
 async function fetchTags() {
+  const supabase = getSupabaseClient();
+
+  if (!supabase) {
+    return {
+      data: [] as TagItem[],
+      error: { message: supabaseConfigError ?? "Supabase 客户端初始化失败" },
+      enabled: false,
+    };
+  }
+
   const result = await supabase
     .from("tags")
     .select("id, name, color")
@@ -226,10 +355,23 @@ export default function Home() {
   const [syncMode, setSyncMode] = useState("轮询兜底中");
   const [supportsFolders, setSupportsFolders] = useState(false);
   const [supportsTags, setSupportsTags] = useState(false);
+  const [supportsSoftDelete, setSupportsSoftDelete] = useState(false);
+  const [supportsServerSearch, setSupportsServerSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const prevNoteCountRef = useRef(0);
   const shouldScrollToBottomRef = useRef(true);
+  const currentSyncMode = supabaseConfigError ? "Supabase 未配置" : syncMode;
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery.trim());
+    }, 250);
+
+    return () => clearTimeout(timeoutId);
+  }, [searchQuery]);
 
   const fetchAppData = useCallback(async (showLoading = false) => {
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -247,7 +389,7 @@ export default function Home() {
       });
 
       const request = Promise.all([
-        fetchNotes(),
+        fetchNotes(debouncedSearchQuery),
         fetchFolders(),
         fetchNoteTags(),
         fetchTags(),
@@ -287,6 +429,8 @@ export default function Home() {
       setAllTags(tagsResult.data);
       setSupportsFolders(foldersResult.enabled);
       setSupportsTags(noteTagsResult.enabled && tagsResult.enabled);
+      setSupportsSoftDelete(notesResult.supportsSoftDelete);
+      setSupportsServerSearch(notesResult.supportsServerSearch);
       setNotes(nextNotes);
 
       setSelectedFolderId((current) => {
@@ -322,15 +466,23 @@ export default function Home() {
       setAllTags([]);
       setSupportsFolders(false);
       setSupportsTags(false);
+      setSupportsSoftDelete(false);
+      setSupportsServerSearch(false);
       setError(error instanceof Error ? error.message : "加载失败，请稍后重试");
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
       setIsLoading(false);
     }
-  }, []);
+  }, [debouncedSearchQuery]);
 
   const ensureTag = useCallback(
     async (name: string) => {
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+      }
+
       const normalized = normalizeName(name);
       const existing = allTags.find((tag) => normalizeName(tag.name) === normalized);
 
@@ -357,6 +509,12 @@ export default function Home() {
     async (noteId: string, tagNames: string[]) => {
       if (!supportsTags || tagNames.length === 0) {
         return;
+      }
+
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
       }
 
       const note = notes.find((item) => item.id === noteId);
@@ -386,6 +544,12 @@ export default function Home() {
     async (noteId: string, content: string) => {
       if (!supportsTags) {
         return;
+      }
+
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
       }
 
       const note = notes.find((item) => item.id === noteId);
@@ -423,6 +587,12 @@ export default function Home() {
   }, [fetchAppData]);
 
   useEffect(() => {
+    const supabase = getSupabaseClient();
+
+    if (!supabase) {
+      return;
+    }
+
     const channel = supabase
       .channel("echo-realtime")
       .on("postgres_changes", { event: "*", schema: "public", table: "notes" }, () => {
@@ -477,14 +647,20 @@ export default function Home() {
   }, [notes]);
 
   const filteredNotes = useMemo(() => {
+    const normalizedSearch = debouncedSearchQuery.toLowerCase();
+
     return notes.filter((note) => {
       const matchesFolder = activeFolderId === "all" || note.folderId === activeFolderId;
       const matchesTag =
         activeTagId === "all" || note.tags.some((tag) => tag.id === activeTagId);
+      const matchesSearch =
+        !normalizedSearch ||
+        supportsServerSearch ||
+        note.content.toLowerCase().includes(normalizedSearch);
 
-      return matchesFolder && matchesTag;
+      return matchesFolder && matchesTag && matchesSearch;
     });
-  }, [activeFolderId, activeTagId, notes]);
+  }, [activeFolderId, activeTagId, debouncedSearchQuery, notes, supportsServerSearch]);
 
   const createFolder = async () => {
     const name = newFolderName.trim();
@@ -496,6 +672,12 @@ export default function Home() {
     setNotice(null);
 
     try {
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+      }
+
       const existing = folders.find(
         (folder) => normalizeName(folder.name) === normalizeName(name),
       );
@@ -580,6 +762,12 @@ export default function Home() {
     setError(null);
 
     try {
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+      }
+
       const { error } = await supabase
         .from("notes")
         .update({ folder_id: folderId })
@@ -590,6 +778,55 @@ export default function Home() {
       await fetchAppData();
     } catch (error) {
       setError(error instanceof Error ? error.message : "移动文件夹失败");
+    } finally {
+      setNoteActionId(null);
+    }
+  };
+
+  const deleteNote = async (note: Note) => {
+    if (!supportsSoftDelete || noteActionId) return;
+
+    const confirmed = window.confirm("确定删除这条消息吗？你之后可以基于软删除继续扩展撤销或回收站。");
+
+    if (!confirmed) return;
+
+    setNoteActionId(note.id);
+    setError(null);
+    setNotice(null);
+
+    try {
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+      }
+
+      const { error } = await supabase
+        .from("notes")
+        .update({ deleted_at: new Date().toISOString() })
+        .eq("id", note.id);
+
+      if (error) throw error;
+
+      if (editingNoteId === note.id) {
+        setEditingNoteId(null);
+        setEditingContent("");
+      }
+
+      setNoteTagInputs((current) => {
+        const next = { ...current };
+        delete next[note.id];
+        return next;
+      });
+      setNoteFolderSelections((current) => {
+        const next = { ...current };
+        delete next[note.id];
+        return next;
+      });
+      setNotice("消息已删除。");
+      await fetchAppData();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "删除消息失败");
     } finally {
       setNoteActionId(null);
     }
@@ -609,6 +846,12 @@ export default function Home() {
     setNotice(null);
 
     try {
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+      }
+
       const { error } = await supabase.from("folders").delete().eq("id", folder.id);
 
       if (error) throw error;
@@ -642,6 +885,12 @@ export default function Home() {
     setNotice(null);
 
     try {
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+      }
+
       const { error } = await supabase.from("tags").delete().eq("id", tag.id);
 
       if (error) throw error;
@@ -681,6 +930,12 @@ export default function Home() {
     setNotice(null);
 
     try {
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+      }
+
       const { error } = await supabase
         .from("notes")
         .update({ content })
@@ -716,6 +971,12 @@ export default function Home() {
     }
 
     try {
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+      }
+
       const { data, error } = await supabase
         .from("notes")
         .insert([payload])
@@ -767,7 +1028,7 @@ export default function Home() {
             <p className="mt-1 text-sm text-gray-500">极简跨端云端剪贴板</p>
           </div>
           <div className="text-right text-xs text-gray-400">
-            <div>{syncMode}</div>
+            <div>{currentSyncMode}</div>
             <div className="mt-1">
               {supportsFolders ? "文件夹 / 标签结构已启用" : "兼容旧表结构"}
             </div>
@@ -933,14 +1194,39 @@ export default function Home() {
 
         <section className="min-w-0 rounded-[2rem] border border-white/70 bg-white/70 shadow-[0_15px_50px_rgba(15,23,42,0.06)] backdrop-blur-xl">
           <div className="border-b border-gray-100 px-5 py-4 sm:px-6">
-            <p className="text-sm text-gray-500">
-              {activeFolderId === "all"
-                ? "全部消息"
-                : `当前文件夹：${folders.find((folder) => folder.id === activeFolderId)?.name ?? "未命名"}`}
-              {activeTagId !== "all"
-                ? ` · 标签：#${allTags.find((tag) => tag.id === activeTagId)?.name ?? ""}`
-                : ""}
-            </p>
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <p className="text-sm text-gray-500">
+                {activeFolderId === "all"
+                  ? "全部消息"
+                  : `当前文件夹：${folders.find((folder) => folder.id === activeFolderId)?.name ?? "未命名"}`}
+                {activeTagId !== "all"
+                  ? ` · 标签：#${allTags.find((tag) => tag.id === activeTagId)?.name ?? ""}`
+                  : ""}
+                {debouncedSearchQuery
+                  ? ` · 搜索：${debouncedSearchQuery}`
+                  : ""}
+              </p>
+
+              <label className="flex items-center gap-2 rounded-full border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-500">
+                <Search size={16} />
+                <input
+                  className="min-w-0 bg-transparent text-sm text-gray-700 outline-none placeholder:text-gray-400 sm:w-56"
+                  placeholder={supportsServerSearch ? "搜索消息内容" : "搜索消息内容（本地匹配）"}
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+                {searchQuery ? (
+                  <button
+                    className="rounded-full p-1 text-gray-400 transition hover:bg-gray-200 hover:text-gray-600"
+                    type="button"
+                    onClick={() => setSearchQuery("")}
+                    aria-label="清空搜索"
+                  >
+                    <X size={14} />
+                  </button>
+                ) : null}
+              </label>
+            </div>
           </div>
 
           <div
@@ -1015,6 +1301,19 @@ export default function Home() {
                                   <Pencil size={14} />
                                   编辑内容
                                 </button>
+                                {supportsSoftDelete ? (
+                                  <button
+                                    className="inline-flex items-center gap-2 rounded-full border border-red-200 px-3 py-1.5 text-xs text-red-500 transition hover:border-red-300 hover:text-red-600 disabled:opacity-50"
+                                    type="button"
+                                    onClick={() => {
+                                      void deleteNote(note);
+                                    }}
+                                    disabled={noteActionId === note.id}
+                                  >
+                                    <Trash2 size={14} />
+                                    删除消息
+                                  </button>
+                                ) : null}
                               </div>
                             </div>
                           )}

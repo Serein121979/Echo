@@ -1,65 +1,113 @@
-# CLAUDE.md
 
-Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
-**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+# Echo — AI 开发上下文文档
 
-## 1. Think Before Coding
-
-**Don't assume. Don't hide confusion. Surface tradeoffs.**
-
-Before implementing:
-- State your assumptions explicitly. If uncertain, ask.
-- If multiple interpretations exist, present them - don't pick silently.
-- If a simpler approach exists, say so. Push back when warranted.
-- If something is unclear, stop. Name what's confusing. Ask.
-
-## 2. Simplicity First
-
-**Minimum code that solves the problem. Nothing speculative.**
-
-- No features beyond what was asked.
-- No abstractions for single-use code.
-- No "flexibility" or "configurability" that wasn't requested.
-- No error handling for impossible scenarios.
-- If you write 200 lines and it could be 50, rewrite it.
-
-Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
-
-## 3. Surgical Changes
-
-**Touch only what you must. Clean up only your own mess.**
-
-When editing existing code:
-- Don't "improve" adjacent code, comments, or formatting.
-- Don't refactor things that aren't broken.
-- Match existing style, even if you'd do it differently.
-- If you notice unrelated dead code, mention it - don't delete it.
-
-When your changes create orphans:
-- Remove imports/variables/functions that YOUR changes made unused.
-- Don't remove pre-existing dead code unless asked.
-
-The test: Every changed line should trace directly to the user's request.
-
-## 4. Goal-Driven Execution
-
-**Define success criteria. Loop until verified.**
-
-Transform tasks into verifiable goals:
-- "Add validation" → "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
-
-For multi-step tasks, state a brief plan:
-```
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
-3. [Step] → verify: [check]
-```
-
-Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+> 本文件用于向 AI 编程助手说明项目背景、技术约束和开发原则。
+> 每次开始新的开发任务前，请将本文件纳入上下文。
 
 ---
 
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+## 项目定位
+
+Echo 是一个**面向个人的跨设备消息同步与整理工具**，灵感来自"给自己发消息"这个最朴素的需求。
+
+**目标用户：只有作者自己（单用户工具）。**
+
+它不是团队协作工具，不是笔记软件，不是 Todo App。
+它就是一个更聪明的"文件传输助手"——收进来、找得到、清得掉。
+
+---
+
+## 核心功能（已实现）
+
+- 跨设备实时同步（Supabase Realtime，轮询兜底）
+- 文件夹管理（创建 / 切换 / 删除，默认收件箱）
+- 标签系统（创建 / 筛选 / 删除，一条消息可多标签）
+- 自动标签（规则型，发送即分类）
+- 消息编辑（编辑后自动刷新自动标签）
+- 消息列表（自动滚动到底部，体验接近 IM）
+
+---
+
+## 技术栈（不要擅自替换）
+
+| 层级 | 技术 | 说明 |
+|------|------|------|
+| 框架 | Next.js 16 | App Router |
+| UI | React 19 + Tailwind CSS 4 | 不引入 UI 组件库 |
+| 语言 | TypeScript | 严格类型 |
+| 后端 / 实时 | Supabase | Database + Realtime |
+| 部署 | Vercel | 默认目标平台 |
+
+**不要引入以下内容（除非明确被要求）：**
+- 额外的状态管理库（Redux、Zustand 等）
+- 额外的 UI 组件库（shadcn/ui、MUI 等）
+- 额外的 ORM 或数据库抽象层
+- 任何需要服务端常驻进程的依赖
+
+---
+
+## 数据库结构
+
+```
+notes       → 消息主体（content, folder_id, created_at, updated_at, deleted_at, is_starred, is_archived）
+folders     → 文件夹
+tags        → 标签
+note_tags   → 消息与标签的多对多关系
+auto_tag_rules → 自动标签规则（match_type, match_value, tag_id, priority）
+```
+
+**软删除原则：** 删除操作只写 `deleted_at`，不物理删除。查询时默认过滤 `deleted_at IS NULL`。
+
+---
+
+## Roadmap（按优先级排列）
+
+### 🔴 P0 — 补全基础功能
+- [x] 删除消息（软删除）（已实现）
+- [x] 全文搜索（PostgreSQL FTS，`tsvector` + `gin` 索引）（已实现）
+
+### 🟠 P1 — 差异化核心体验
+- [ ] 收藏 / 归档（`is_starred` / `is_archived` 字段）
+- [ ] 自动标签规则可配置（UI 可增删改规则）
+
+### 🟡 P2 — 体验打磨
+- [ ] PWA 安装体验（`next-pwa` 或 `@ducanh2912/next-pwa`）
+- [ ] 移动端体验优化（输入框 / 键盘遮挡 / `dvh` 单位）
+
+### 🟢 P3 — AI 增强（基础稳定后再做）
+- [ ] AI 自动分类（Supabase Edge Function → AI API → 写回 note）
+- [ ] AI 自动摘要
+
+---
+
+## 开发原则
+
+1. **单用户优先**：不要过度设计权限系统、团队功能、分享功能。
+2. **数据库是真相来源**：业务逻辑尽量下沉到 SQL / Supabase RLS，不要在前端维护复杂状态。
+3. **渐进增强**：先做能用，再做好用，最后做智能。不要跳过基础功能直接上 AI。
+4. **不破坏已有功能**：每次修改前确认现有的实时同步、自动标签、文件夹逻辑不受影响。
+5. **移动端同等重要**：所有新 UI 必须在 375px 宽度下可用，优先用 Tailwind 的响应式前缀处理。
+6. **软删除**：任何涉及删除的功能，一律使用 `deleted_at` 软删除，不执行物理 `DELETE`。
+
+---
+
+## 当前已知问题 / 技术债
+
+- 自动标签规则目前硬编码在前端，待迁移至数据库驱动
+- 移动端键盘弹起时输入框可能被遮挡（`vh` 单位问题）
+- 搜索目前已接入数据库全文搜索，旧表结构下会降级为前端内容匹配
+
+---
+
+## 不在范围内的功能（除非作者明确要求）
+
+- 多用户 / 账号系统
+- 文件上传（图片、附件等二进制内容）
+- 消息分享给他人
+- 第三方登录
+- 消息加密
+
+---
+
+*最后更新：P0 删除消息与全文搜索已完成*
