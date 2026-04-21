@@ -24,9 +24,12 @@ Echo 是一个**面向个人的跨设备消息同步与整理工具**，灵感�
 - 文件夹管理（创建 / 切换 / 删除，默认收件箱）
 - 标签系统（创建 / 筛选 / 删除，一条消息可多标签）
 - 自动标签（数据库规则驱动，支持 UI 增删改）
+- 附件消息（支持粘贴图片、选择文件、跨端下载）
 - 消息编辑（编辑后自动刷新自动标签）
 - 消息列表（自动滚动到底部，体验接近 IM）
 - 收藏 / 归档（支持主列表、收藏、归档三种视图，字段为 `is_starred` / `is_archived`）
+- 黑白极简界面（侧边栏默认收起，点击后抽屉展开）
+- PWA 基础安装体验（manifest + 安装提示）
 
 ---
 
@@ -51,11 +54,12 @@ Echo 是一个**面向个人的跨设备消息同步与整理工具**，灵感�
 ## 数据库结构
 
 ```
-notes       → 消息主体（content, folder_id, created_at, updated_at, deleted_at, is_starred, is_archived）
+notes       → 消息主体（content, folder_id, created_at, updated_at, deleted_at, is_starred, is_archived, file_path, file_url, file_name, file_type, file_size）
 folders     → 文件夹
 tags        → 标签
 note_tags   → 消息与标签的多对多关系
 auto_tag_rules → 自动标签规则（match_type, match_value, tag_id, priority）
+storage bucket echo-files → 附件存储
 ```
 
 **软删除原则：** 删除操作只写 `deleted_at`，不物理删除。查询时默认过滤 `deleted_at IS NULL`。
@@ -73,8 +77,8 @@ auto_tag_rules → 自动标签规则（match_type, match_value, tag_id, priorit
 - [x] 自动标签规则可配置（UI 可增删改规则）
 
 ### 🟡 P2 — 体验打磨
-- [ ] PWA 安装体验（`next-pwa` 或 `@ducanh2912/next-pwa`）
-- [ ] 移动端体验优化（输入框 / 键盘遮挡 / `dvh` 单位）
+- [x] PWA 安装体验（基础版 manifest + 安装提示）
+- [x] 移动端体验优化（抽屉侧边栏、黑白极简 UI、`dvh` 单位）
 
 ### 🟢 P3 — AI 增强（基础稳定后再做）
 - [ ] AI 自动分类（Supabase Edge Function → AI API → 写回 note）
@@ -95,9 +99,8 @@ auto_tag_rules → 自动标签规则（match_type, match_value, tag_id, priorit
 
 ## 当前已知问题 / 技术债
 
-- 新环境需执行最新 `supabase/schema.sql` 才能启用 `auto_tag_rules` 表与默认规则
+- 新环境需执行最新 `supabase/schema.sql` 才能启用 `auto_tag_rules`、附件字段和 `echo-files` 存储桶
 - 当前开发环境如果要通过局域网 IP 访问，需要确认 `next.config.ts` 的 `allowedDevOrigins` 与本机 IP 一致
-- 移动端键盘弹起时输入框可能被遮挡（`vh` 单位问题）
 - 搜索目前已接入数据库全文搜索，旧表结构下会降级为前端内容匹配
 
 ---
@@ -112,4 +115,4 @@ auto_tag_rules → 自动标签规则（match_type, match_value, tag_id, priorit
 
 ---
 
-*最后更新：P1 收藏 / 归档与自动标签规则配置已完成*
+*最后更新：P2 黑白极简移动端体验、PWA 基础安装与附件发送下载已完成*

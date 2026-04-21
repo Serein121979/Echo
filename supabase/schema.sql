@@ -57,6 +57,21 @@ alter table public.notes
 alter table public.notes
   add column if not exists is_archived boolean not null default false;
 
+alter table public.notes
+  add column if not exists file_path text;
+
+alter table public.notes
+  add column if not exists file_url text;
+
+alter table public.notes
+  add column if not exists file_name text;
+
+alter table public.notes
+  add column if not exists file_type text;
+
+alter table public.notes
+  add column if not exists file_size bigint;
+
 create index if not exists notes_deleted_at_idx
   on public.notes (deleted_at);
 
@@ -110,6 +125,12 @@ insert into public.folders (name)
 select '收件箱'
 where not exists (
   select 1 from public.folders where lower(name) = lower('收件箱')
+);
+
+insert into storage.buckets (id, name, public, file_size_limit)
+select 'echo-files', 'echo-files', true, 52428800
+where not exists (
+  select 1 from storage.buckets where id = 'echo-files'
 );
 
 insert into public.tags (name, color)
@@ -218,6 +239,18 @@ begin
     to anon, authenticated
     using (true)
     with check (true);
+  end if;
+
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'storage' and tablename = 'objects' and policyname = 'Public access to echo-files objects'
+  ) then
+    create policy "Public access to echo-files objects"
+    on storage.objects
+    for all
+    to anon, authenticated
+    using (bucket_id = 'echo-files')
+    with check (bucket_id = 'echo-files');
   end if;
 end
 $$;

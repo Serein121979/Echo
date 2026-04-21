@@ -25,6 +25,11 @@ type NoteRow = {
   deleted_at?: string | null;
   is_starred?: boolean;
   is_archived?: boolean;
+  file_path?: string | null;
+  file_url?: string | null;
+  file_name?: string | null;
+  file_type?: string | null;
+  file_size?: number | null;
 };
 
 type NoteTagRow = {
@@ -52,6 +57,11 @@ type Note = {
   tags: TagItem[];
   isStarred: boolean;
   isArchived: boolean;
+  filePath: string | null;
+  fileUrl: string | null;
+  fileName: string | null;
+  fileType: string | null;
+  fileSize: number | null;
 };
 
 type AutoTagRule = {
@@ -63,8 +73,15 @@ type AutoTagRule = {
   tag: TagItem;
 };
 
+type BeforeInstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed"; platform: string }>;
+};
+
 const FETCH_TIMEOUT_MS = 8000;
 const FALLBACK_POLL_MS = 60000;
+const STORAGE_BUCKET = "echo-files";
+const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024;
 const TAG_COLORS = {
   待办: "#f97316",
   链接: "#2563eb",
@@ -137,7 +154,7 @@ function getTagColor(name: string, currentCount: number) {
     return direct;
   }
 
-  const palette = ["#2563eb", "#16a34a", "#ea580c", "#9333ea", "#db2777"];
+  const palette = ["#111111", "#262626", "#404040", "#525252", "#737373"];
   return palette[currentCount % palette.length];
 }
 
@@ -220,6 +237,49 @@ function inferAutoTags(content: string, rules: AutoTagRule[]) {
   return Array.from(next);
 }
 
+function formatFileSize(size: number | null) {
+  if (!size || size <= 0) {
+    return null;
+  }
+
+  if (size < 1024) {
+    return `${size} B`;
+  }
+
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function buildDownloadUrl(url: string, fileName: string | null) {
+  if (!fileName) {
+    return url;
+  }
+
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}download=${encodeURIComponent(fileName)}`;
+}
+
+function getErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "message" in error &&
+    typeof error.message === "string" &&
+    error.message
+  ) {
+    return error.message;
+  }
+
+  return fallback;
+}
+
 function buildNotesQuery(
   supabase: NonNullable<ReturnType<typeof getSupabaseClient>>,
   selectClause: string,
@@ -258,7 +318,7 @@ async function fetchNotes(searchQuery: string): Promise<FetchNotesResult> {
   const normalizedSearch = searchQuery.trim();
   const latestShape = await buildNotesQuery(
     supabase,
-    "id, content, created_at, folder_id, deleted_at, is_starred, is_archived",
+    "id, content, created_at, folder_id, deleted_at, is_starred, is_archived, file_path, file_url, file_name, file_type, file_size",
     normalizedSearch,
     normalizedSearch.length > 0,
   );
@@ -283,7 +343,7 @@ async function fetchNotes(searchQuery: string): Promise<FetchNotesResult> {
 
   const withoutSearchVector = await buildNotesQuery(
     supabase,
-    "id, content, created_at, folder_id, deleted_at, is_starred, is_archived",
+    "id, content, created_at, folder_id, deleted_at, is_starred, is_archived, file_path, file_url, file_name, file_type, file_size",
     normalizedSearch,
     false,
   );
@@ -340,6 +400,11 @@ async function fetchNotes(searchQuery: string): Promise<FetchNotesResult> {
       folder_id: null,
       is_starred: false,
       is_archived: false,
+      file_path: null,
+      file_url: null,
+      file_name: null,
+      file_type: null,
+      file_size: null,
     })),
     error: legacyShape.error,
     supportsSoftDelete: false,
@@ -516,10 +581,26 @@ export default function Home() {
   const [supportsServerSearch, setSupportsServerSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [installPromptEvent, setInstallPromptEvent] = useState<BeforeInstallPromptEvent | null>(
+    null,
+  );
+  const [showIosInstallHint] = useState(() => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+
+    const userAgent = window.navigator.userAgent.toLowerCase();
+    const isIos = /iphone|ipad|ipod/.test(userAgent);
+    const isStandalone = window.matchMedia("(display-mode: standalone)").matches;
+    return isIos && !isStandalone;
+  });
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const prevNoteCountRef = useRef(0);
   const shouldScrollToBottomRef = useRef(true);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const currentSyncMode = supabaseConfigError ? "Supabase 未配置" : syncMode;
   const effectiveAutoTagRules = useMemo<AutoTagRule[]>(
     () =>
@@ -551,6 +632,19 @@ export default function Home() {
 
     return () => clearTimeout(timeoutId);
   }, [searchQuery]);
+
+  useEffect(() => {
+    const handleBeforeInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      setInstallPromptEvent(event as BeforeInstallPromptEvent);
+    };
+
+    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+
+    return () => {
+      window.removeEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+    };
+  }, []);
 
   const fetchAppData = useCallback(async (showLoading = false) => {
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -606,6 +700,11 @@ export default function Home() {
         tags: tagsByNoteId.get(note.id) ?? [],
         isStarred: note.is_starred ?? false,
         isArchived: note.is_archived ?? false,
+        filePath: note.file_path ?? null,
+        fileUrl: note.file_url ?? null,
+        fileName: note.file_name ?? null,
+        fileType: note.file_type ?? null,
+        fileSize: note.file_size ?? null,
       }));
       const nextAutoTagRules = autoTagRulesResult.data.flatMap((rule) => {
         const rawTag = Array.isArray(rule.tag) ? rule.tag[0] : rule.tag;
@@ -676,7 +775,7 @@ export default function Home() {
       setSupportsAutoTagRules(false);
       setSupportsSoftDelete(false);
       setSupportsServerSearch(false);
-      setError(error instanceof Error ? error.message : "加载失败，请稍后重试");
+      setError(getErrorMessage(error, "加载失败，请稍后重试"));
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
       setIsLoading(false);
@@ -712,6 +811,18 @@ export default function Home() {
     },
     [allTags],
   );
+
+  const queuePendingFile = useCallback((file: File) => {
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      setError("文件不能超过 50MB。");
+      return false;
+    }
+
+    setPendingFile(file);
+    setError(null);
+    setNotice(`已选择附件：${file.name}`);
+    return true;
+  }, []);
 
   const applyTagsToNote = useCallback(
     async (noteId: string, tagNames: string[]) => {
@@ -922,7 +1033,7 @@ export default function Home() {
       setNotice(`已创建文件夹“${folder.name}”。`);
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "创建文件夹失败");
+      setError(getErrorMessage(error, "创建文件夹失败"));
     } finally {
       setIsCreatingFolder(false);
     }
@@ -944,7 +1055,7 @@ export default function Home() {
       setNotice(`已创建标签“#${tag.name}”。`);
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "创建标签失败");
+      setError(getErrorMessage(error, "创建标签失败"));
     } finally {
       setIsCreatingTag(false);
     }
@@ -964,7 +1075,7 @@ export default function Home() {
       setNoteTagInputs((current) => ({ ...current, [noteId]: "" }));
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "添加标签失败");
+      setError(getErrorMessage(error, "添加标签失败"));
     } finally {
       setNoteActionId(null);
     }
@@ -994,7 +1105,7 @@ export default function Home() {
 
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "移动文件夹失败");
+      setError(getErrorMessage(error, "移动文件夹失败"));
     } finally {
       setNoteActionId(null);
     }
@@ -1024,7 +1135,7 @@ export default function Home() {
       setNotice(note.isStarred ? "已取消收藏。" : "已加入收藏。");
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "更新收藏状态失败");
+      setError(getErrorMessage(error, "更新收藏状态失败"));
     } finally {
       setNoteActionId(null);
     }
@@ -1054,7 +1165,7 @@ export default function Home() {
       setNotice(note.isArchived ? "已恢复到主列表。" : "已归档消息。");
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "更新归档状态失败");
+      setError(getErrorMessage(error, "更新归档状态失败"));
     } finally {
       setNoteActionId(null);
     }
@@ -1103,7 +1214,7 @@ export default function Home() {
       setNotice("消息已删除。");
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "删除消息失败");
+      setError(getErrorMessage(error, "删除消息失败"));
     } finally {
       setNoteActionId(null);
     }
@@ -1144,7 +1255,7 @@ export default function Home() {
       setNotice(`已删除文件夹“${folder.name}”。`);
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "删除文件夹失败");
+      setError(getErrorMessage(error, "删除文件夹失败"));
     } finally {
       setIsCreatingFolder(false);
     }
@@ -1179,7 +1290,7 @@ export default function Home() {
       setNotice(`已删除标签“#${tag.name}”。`);
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "删除标签失败");
+      setError(getErrorMessage(error, "删除标签失败"));
     } finally {
       setIsCreatingTag(false);
     }
@@ -1232,7 +1343,7 @@ export default function Home() {
       setNotice("自动标签规则已创建。");
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "创建自动标签规则失败");
+      setError(getErrorMessage(error, "创建自动标签规则失败"));
     } finally {
       setIsSavingRule(false);
     }
@@ -1303,7 +1414,7 @@ export default function Home() {
       setNotice("自动标签规则已更新。");
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "更新自动标签规则失败");
+      setError(getErrorMessage(error, "更新自动标签规则失败"));
     } finally {
       setIsSavingRule(false);
     }
@@ -1338,7 +1449,7 @@ export default function Home() {
       setNotice("自动标签规则已删除。");
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "删除自动标签规则失败");
+      setError(getErrorMessage(error, "删除自动标签规则失败"));
     } finally {
       setIsSavingRule(false);
     }
@@ -1385,14 +1496,14 @@ export default function Home() {
       setNotice("已更新消息内容，并同步刷新自动标签。");
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "编辑消息失败");
+      setError(getErrorMessage(error, "编辑消息失败"));
     } finally {
       setNoteActionId(null);
     }
   };
 
   const handleSend = async () => {
-    if (!input.trim() || isSending) return;
+    if ((!input.trim() && !pendingFile) || isSending) return;
 
     setIsSending(true);
     setError(null);
@@ -1400,7 +1511,15 @@ export default function Home() {
     shouldScrollToBottomRef.current = true;
 
     const content = input.trim();
-    const payload: { content: string; folder_id?: string | null } = { content };
+    const payload: {
+      content: string;
+      folder_id?: string | null;
+      file_path?: string;
+      file_url?: string;
+      file_name?: string;
+      file_type?: string;
+      file_size?: number;
+    } = { content };
 
     if (supportsFolders) {
       payload.folder_id = selectedFolderId || null;
@@ -1413,6 +1532,10 @@ export default function Home() {
         throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
       }
 
+      if (pendingFile) {
+        Object.assign(payload, await uploadPendingFile(pendingFile));
+      }
+
       const { data, error } = await supabase
         .from("notes")
         .insert([payload])
@@ -1422,6 +1545,7 @@ export default function Home() {
       if (error) throw error;
 
       setInput("");
+      setPendingFile(null);
 
       if (supportsTags && data?.id) {
         const autoTags = inferAutoTags(content, effectiveAutoTagRules);
@@ -1430,7 +1554,8 @@ export default function Home() {
 
       await fetchAppData();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "发送失败，请稍后重试");
+      console.error("handleSend failed", error);
+      setError(getErrorMessage(error, "发送失败，请稍后重试"));
     } finally {
       setIsSending(false);
     }
@@ -1443,6 +1568,30 @@ export default function Home() {
     }
   };
 
+  const handleComposerPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const file = Array.from(e.clipboardData.items)
+      .map((item) => item.getAsFile())
+      .find((candidate): candidate is File => Boolean(candidate && candidate.type.startsWith("image/")));
+
+    if (!file) {
+      return;
+    }
+
+    e.preventDefault();
+    queuePendingFile(file);
+  };
+
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+
+    if (!file) {
+      return;
+    }
+
+    queuePendingFile(file);
+    e.target.value = "";
+  };
+
   const handleCreateInputKeyDown = (
     e: React.KeyboardEvent<HTMLInputElement>,
     action: () => Promise<void>,
@@ -1453,463 +1602,533 @@ export default function Home() {
     }
   };
 
+  const installApp = async () => {
+    if (!installPromptEvent) return;
+
+    await installPromptEvent.prompt();
+    await installPromptEvent.userChoice;
+    setInstallPromptEvent(null);
+  };
+
+  const uploadPendingFile = async (file: File) => {
+    const supabase = getSupabaseClient();
+
+    if (!supabase) {
+      throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+    }
+
+    const extension = file.name.includes(".") ? file.name.split(".").pop() : "";
+    const path = `${new Date().toISOString().slice(0, 10)}/${crypto.randomUUID()}${extension ? `.${extension}` : ""}`;
+    const { error: uploadError } = await supabase
+      .storage
+      .from(STORAGE_BUCKET)
+      .upload(path, file, {
+        cacheControl: "3600",
+        contentType: file.type || undefined,
+        upsert: false,
+      });
+
+    if (uploadError) {
+      throw uploadError;
+    }
+
+    const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(path);
+
+    return {
+      file_path: path,
+      file_url: data.publicUrl,
+      file_name: file.name,
+      file_type: file.type || "application/octet-stream",
+      file_size: file.size,
+    };
+  };
+
   return (
-    <div className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(37,99,235,0.10),_transparent_35%),linear-gradient(to_bottom,_#f8fafc,_#eef2ff)]">
-      <header className="sticky top-0 z-20 border-b border-white/70 bg-white/80 backdrop-blur-xl">
+    <div className="min-h-[100dvh] bg-[#f5f5f5] text-neutral-950">
+      {isSidebarOpen ? (
+        <div className="fixed inset-0 z-40 bg-black/55" onClick={() => setIsSidebarOpen(false)}>
+          <aside
+            className="h-[100dvh] w-[min(88vw,360px)] overflow-y-auto border-r border-neutral-200 bg-white p-4 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <p className="text-sm font-semibold text-neutral-950">侧边栏</p>
+                <p className="text-xs text-neutral-500">筛选、分类和规则管理</p>
+              </div>
+              <button
+                className="rounded-full border border-neutral-200 p-2 text-neutral-500"
+                type="button"
+                onClick={() => setIsSidebarOpen(false)}
+                aria-label="关闭侧边栏"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            {error ? (
+              <div className="mb-4 rounded-2xl border border-neutral-300 bg-neutral-100 px-4 py-3 text-sm text-neutral-700">
+                {error}
+              </div>
+            ) : null}
+
+            {notice ? (
+              <div className="mb-4 rounded-2xl border border-neutral-300 bg-white px-4 py-3 text-sm text-neutral-700">
+                {notice}
+              </div>
+            ) : null}
+
+            <div className="space-y-4">
+              <section className="rounded-3xl border border-neutral-200 bg-white p-4">
+                <div className="mb-3 flex items-center gap-2 text-sm font-medium text-neutral-800">
+                  <Folder size={16} />
+                  文件夹
+                </div>
+                <div className="space-y-2">
+                  <button
+                    className={`w-full rounded-2xl px-4 py-3 text-left text-sm ${
+                      activeFolderId === "all"
+                        ? "bg-neutral-950 text-white"
+                        : "bg-neutral-100 text-neutral-600"
+                    }`}
+                    type="button"
+                    onClick={() => setActiveFolderId("all")}
+                  >
+                    全部文件夹
+                  </button>
+                  {folders.map((folder) => (
+                    <div
+                      key={folder.id}
+                      className={`flex items-center gap-2 rounded-2xl px-3 py-2 ${
+                        activeFolderId === folder.id
+                          ? "bg-neutral-950 text-white"
+                          : "bg-neutral-100 text-neutral-600"
+                      }`}
+                    >
+                      <button
+                        className="min-w-0 flex-1 px-1 py-1 text-left text-sm"
+                        type="button"
+                        onClick={() => setActiveFolderId(folder.id)}
+                      >
+                        <span className="truncate">{folder.name}</span>
+                      </button>
+                      <button
+                        className="rounded-full p-1 opacity-70"
+                        type="button"
+                        onClick={() => {
+                          void deleteFolder(folder);
+                        }}
+                        aria-label={`删除文件夹 ${folder.name}`}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                {supportsFolders ? (
+                  <div className="mt-4 flex gap-2">
+                    <input
+                      className="min-w-0 flex-1 rounded-2xl border border-neutral-200 bg-neutral-100 px-4 py-3 text-sm text-neutral-800 outline-none"
+                      placeholder="新建文件夹"
+                      value={newFolderName}
+                      onChange={(e) => setNewFolderName(e.target.value)}
+                      onKeyDown={(e) => handleCreateInputKeyDown(e, createFolder)}
+                    />
+                    <button
+                      className="inline-flex shrink-0 items-center gap-2 rounded-2xl bg-neutral-950 px-4 py-3 text-sm text-white disabled:opacity-50"
+                      type="button"
+                      onClick={() => {
+                        void createFolder();
+                      }}
+                      disabled={!newFolderName.trim() || isCreatingFolder}
+                    >
+                      <Plus size={16} />
+                      {isCreatingFolder ? "创建中" : "新建"}
+                    </button>
+                  </div>
+                ) : null}
+              </section>
+
+              <section className="rounded-3xl border border-neutral-200 bg-white p-4">
+                <div className="mb-3 flex items-center gap-2 text-sm font-medium text-neutral-800">
+                  <Tag size={16} />
+                  标签
+                </div>
+                <div className="space-y-2">
+                  <button
+                    className={`w-full rounded-2xl px-4 py-3 text-left text-sm ${
+                      activeTagId === "all"
+                        ? "bg-neutral-950 text-white"
+                        : "bg-neutral-100 text-neutral-600"
+                    }`}
+                    type="button"
+                    onClick={() => setActiveTagId("all")}
+                  >
+                    全部标签
+                  </button>
+                  {allTags.map((tag) => (
+                    <div
+                      key={tag.id}
+                      className={`flex items-center gap-2 rounded-2xl px-3 py-2 ${
+                        activeTagId === tag.id
+                          ? "bg-neutral-950 text-white"
+                          : "bg-neutral-100 text-neutral-700"
+                      }`}
+                    >
+                      <button
+                        className="min-w-0 flex-1 px-1 py-1 text-left text-sm"
+                        type="button"
+                        onClick={() => setActiveTagId(tag.id)}
+                      >
+                        <span className="truncate">#{tag.name}</span>
+                      </button>
+                      <button
+                        className="rounded-full p-1 opacity-80"
+                        type="button"
+                        onClick={() => {
+                          void deleteTag(tag);
+                        }}
+                        aria-label={`删除标签 ${tag.name}`}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                {supportsTags ? (
+                  <div className="mt-4 flex gap-2">
+                    <input
+                      className="min-w-0 flex-1 rounded-2xl border border-neutral-200 bg-neutral-100 px-4 py-3 text-sm text-neutral-800 outline-none"
+                      placeholder="新建标签"
+                      value={newTagName}
+                      onChange={(e) => setNewTagName(e.target.value)}
+                      onKeyDown={(e) => handleCreateInputKeyDown(e, createTag)}
+                    />
+                    <button
+                      className="inline-flex shrink-0 items-center gap-2 rounded-2xl bg-neutral-950 px-4 py-3 text-sm text-white disabled:opacity-50"
+                      type="button"
+                      onClick={() => {
+                        void createTag();
+                      }}
+                      disabled={!newTagName.trim() || isCreatingTag}
+                    >
+                      <Plus size={16} />
+                      {isCreatingTag ? "创建中" : "新建"}
+                    </button>
+                  </div>
+                ) : null}
+              </section>
+
+              <section className="rounded-3xl border border-neutral-200 bg-white p-4">
+                <div className="mb-3 flex items-center gap-2 text-sm font-medium text-neutral-800">
+                  <Star size={16} />
+                  自动标签规则
+                </div>
+                <p className="text-xs leading-6 text-neutral-500">
+                  {supportsAutoTagRules
+                    ? "发送和编辑消息时会按规则自动打标签。"
+                    : "当前还是兼容旧版内置规则。执行最新 schema 后，这里就能直接配置。"}
+                </p>
+                <div className="mt-4 space-y-3">
+                  {effectiveAutoTagRules.map((rule) => {
+                    const isEditing = editingRuleId === rule.id && editingRuleDraft;
+
+                    return (
+                      <div
+                        key={rule.id}
+                        className="rounded-2xl border border-neutral-200 bg-neutral-50 px-3 py-3"
+                      >
+                        {isEditing ? (
+                          <div className="space-y-3">
+                            <div className="grid gap-2 sm:grid-cols-2">
+                              <select
+                                className="rounded-2xl border border-neutral-200 bg-white px-3 py-2 text-xs text-neutral-700 outline-none"
+                                value={editingRuleDraft.tagId}
+                                onChange={(e) =>
+                                  setEditingRuleDraft((current) =>
+                                    current ? { ...current, tagId: e.target.value } : current,
+                                  )
+                                }
+                              >
+                                {allTags.map((tag) => (
+                                  <option key={tag.id} value={tag.id}>
+                                    #{tag.name}
+                                  </option>
+                                ))}
+                              </select>
+                              <select
+                                className="rounded-2xl border border-neutral-200 bg-white px-3 py-2 text-xs text-neutral-700 outline-none"
+                                value={editingRuleDraft.matchType}
+                                onChange={(e) =>
+                                  setEditingRuleDraft((current) =>
+                                    current
+                                      ? {
+                                          ...current,
+                                          matchType: e.target.value as AutoTagMatchType,
+                                          matchValue: requiresMatchValue(
+                                            e.target.value as AutoTagMatchType,
+                                          )
+                                            ? current.matchValue
+                                            : "",
+                                        }
+                                      : current,
+                                  )
+                                }
+                              >
+                                {MATCH_TYPE_OPTIONS.map((option) => (
+                                  <option key={option.value} value={option.value}>
+                                    {option.label}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_90px]">
+                              <input
+                                className="rounded-2xl border border-neutral-200 bg-white px-3 py-2 text-xs text-neutral-700 outline-none"
+                                placeholder={getRuleInputPlaceholder(editingRuleDraft.matchType)}
+                                value={editingRuleDraft.matchValue}
+                                onChange={(e) =>
+                                  setEditingRuleDraft((current) =>
+                                    current ? { ...current, matchValue: e.target.value } : current,
+                                  )
+                                }
+                                disabled={!requiresMatchValue(editingRuleDraft.matchType)}
+                              />
+                              <input
+                                className="rounded-2xl border border-neutral-200 bg-white px-3 py-2 text-xs text-neutral-700 outline-none"
+                                placeholder="优先级"
+                                value={editingRuleDraft.priority}
+                                onChange={(e) =>
+                                  setEditingRuleDraft((current) =>
+                                    current ? { ...current, priority: e.target.value } : current,
+                                  )
+                                }
+                              />
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                className="rounded-full bg-neutral-950 px-3 py-1.5 text-xs text-white disabled:opacity-50"
+                                type="button"
+                                onClick={() => {
+                                  void saveEditedRule(rule.id);
+                                }}
+                                disabled={isSavingRule}
+                              >
+                                保存
+                              </button>
+                              <button
+                                className="rounded-full border border-neutral-200 px-3 py-1.5 text-xs text-neutral-600"
+                                type="button"
+                                onClick={cancelEditingRule}
+                              >
+                                取消
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-2 text-xs">
+                                  <span className="rounded-full bg-neutral-900 px-2.5 py-1 font-medium text-white">
+                                    #{rule.tag.name}
+                                  </span>
+                                  <span className="rounded-full bg-white px-2.5 py-1 text-neutral-600">
+                                    {MATCH_TYPE_OPTIONS.find((option) => option.value === rule.matchType)?.label}
+                                  </span>
+                                  <span className="rounded-full bg-white px-2.5 py-1 text-neutral-500">
+                                    P{rule.priority}
+                                  </span>
+                                </div>
+                                <p className="mt-2 break-words text-xs leading-5 text-neutral-500">
+                                  {requiresMatchValue(rule.matchType)
+                                    ? rule.matchValue
+                                    : getRuleHelperText(rule.matchType)}
+                                </p>
+                              </div>
+                              {supportsAutoTagRules ? (
+                                <div className="flex shrink-0 items-center gap-1">
+                                  <button
+                                    className="rounded-full p-2 text-neutral-500"
+                                    type="button"
+                                    onClick={() => startEditingRule(rule)}
+                                    aria-label="编辑规则"
+                                  >
+                                    <Pencil size={14} />
+                                  </button>
+                                  <button
+                                    className="rounded-full p-2 text-neutral-500 disabled:opacity-50"
+                                    type="button"
+                                    onClick={() => {
+                                      void deleteAutoTagRule(rule);
+                                    }}
+                                    disabled={isSavingRule}
+                                    aria-label="删除规则"
+                                  >
+                                    <Trash2 size={14} />
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                {supportsAutoTagRules && supportsTags ? (
+                  <div className="mt-4 space-y-2 rounded-2xl border border-dashed border-neutral-200 bg-white p-3">
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <select
+                        className="rounded-2xl border border-neutral-200 bg-neutral-100 px-3 py-2 text-xs text-neutral-700 outline-none"
+                        value={newRuleTagId}
+                        onChange={(e) => setNewRuleTagId(e.target.value)}
+                      >
+                        {allTags.map((tag) => (
+                          <option key={tag.id} value={tag.id}>
+                            #{tag.name}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        className="rounded-2xl border border-neutral-200 bg-neutral-100 px-3 py-2 text-xs text-neutral-700 outline-none"
+                        value={newRuleMatchType}
+                        onChange={(e) => {
+                          const nextMatchType = e.target.value as AutoTagMatchType;
+                          setNewRuleMatchType(nextMatchType);
+                          if (!requiresMatchValue(nextMatchType)) {
+                            setNewRuleMatchValue("");
+                          }
+                        }}
+                      >
+                        {MATCH_TYPE_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_90px]">
+                      <input
+                        className="rounded-2xl border border-neutral-200 bg-neutral-100 px-3 py-2 text-xs text-neutral-700 outline-none"
+                        placeholder={getRuleInputPlaceholder(newRuleMatchType)}
+                        value={newRuleMatchValue}
+                        onChange={(e) => setNewRuleMatchValue(e.target.value)}
+                        disabled={!requiresMatchValue(newRuleMatchType)}
+                      />
+                      <input
+                        className="rounded-2xl border border-neutral-200 bg-neutral-100 px-3 py-2 text-xs text-neutral-700 outline-none"
+                        placeholder="优先级"
+                        value={newRulePriority}
+                        onChange={(e) => setNewRulePriority(e.target.value)}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-[11px] leading-5 text-neutral-400">
+                        {getRuleHelperText(newRuleMatchType)}
+                      </p>
+                      <button
+                        className="inline-flex items-center gap-2 rounded-full bg-neutral-950 px-4 py-2 text-xs text-white disabled:opacity-50"
+                        type="button"
+                        onClick={() => {
+                          void createAutoTagRule();
+                        }}
+                        disabled={isSavingRule || !newRuleTagId}
+                      >
+                        <Plus size={14} />
+                        新建规则
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+              </section>
+            </div>
+          </aside>
+        </div>
+      ) : null}
+
+      <header className="sticky top-0 z-30 border-b border-neutral-200 bg-white/92 backdrop-blur">
         <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-4 sm:px-6">
           <div>
-            <h1 className="bg-gradient-to-r from-blue-600 to-sky-500 bg-clip-text text-2xl font-bold text-transparent">
-              Echo
-            </h1>
-            <p className="mt-1 text-sm text-gray-500">极简跨端云端剪贴板</p>
+            <h1 className="text-2xl font-semibold tracking-tight text-neutral-950">Echo</h1>
+            <p className="mt-1 text-sm text-neutral-500">黑白极简的跨设备自发消息箱</p>
           </div>
-          <div className="text-right text-xs text-gray-400">
-            <div>{currentSyncMode}</div>
-            <div className="mt-1">
-              {supportsAutoTagRules
-                ? "文件夹 / 标签 / 自动规则已启用"
-                : supportsFolders
-                  ? "文件夹 / 标签结构已启用"
-                  : "兼容旧表结构"}
-            </div>
+          <div className="flex items-center gap-2">
+            <button
+              className="rounded-full border border-neutral-200 bg-white px-4 py-2 text-sm text-neutral-700"
+              type="button"
+              onClick={() => setIsSidebarOpen(true)}
+            >
+              打开侧边栏
+            </button>
           </div>
         </div>
       </header>
 
-      <div className="mx-auto grid max-w-6xl gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[300px_minmax(0,1fr)]">
-        <aside className="space-y-5 lg:sticky lg:top-24 lg:h-[calc(100vh-8rem)] lg:overflow-auto">
-          {error ? (
-            <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-600">
-              {error}
-            </div>
-          ) : null}
-
-          {notice ? (
-            <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
-              {notice}
-            </div>
-          ) : null}
-
-          <section className="rounded-3xl border border-white/70 bg-white/85 p-4 shadow-[0_10px_40px_rgba(15,23,42,0.05)]">
-            <div className="mb-3 flex items-center gap-2 text-sm font-medium text-gray-700">
-              <Folder size={16} />
-              文件夹
-            </div>
-
-            <div className="space-y-2">
-              <button
-                className={`w-full rounded-2xl px-4 py-3 text-left text-sm transition ${
-                  activeFolderId === "all"
-                    ? "bg-blue-600 text-white"
-                    : "bg-gray-50 text-gray-600 hover:bg-blue-50"
-                }`}
-                type="button"
-                onClick={() => setActiveFolderId("all")}
-              >
-                全部文件夹
-              </button>
-              {folders.map((folder) => (
-                <div
-                  key={folder.id}
-                  className={`flex items-center gap-2 rounded-2xl px-3 py-2 transition ${
-                    activeFolderId === folder.id
-                      ? "bg-blue-600 text-white"
-                      : "bg-gray-50 text-gray-600 hover:bg-blue-50"
-                  }`}
-                >
-                  <button
-                    className="min-w-0 flex-1 px-1 py-1 text-left text-sm"
-                    type="button"
-                    onClick={() => setActiveFolderId(folder.id)}
-                  >
-                    <span className="truncate">{folder.name}</span>
-                  </button>
-                  <button
-                    className="rounded-full p-1 opacity-70 transition hover:bg-black/10 hover:opacity-100"
-                    type="button"
-                    onClick={() => {
-                      void deleteFolder(folder);
-                    }}
-                    aria-label={`删除文件夹 ${folder.name}`}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-              ))}
-            </div>
-
-            {supportsFolders ? (
-              <div className="mt-4 flex gap-2">
-                <input
-                  className="min-w-0 flex-1 rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-700 outline-none ring-0 focus:border-blue-400"
-                  placeholder="新建文件夹"
-                  value={newFolderName}
-                  onChange={(e) => setNewFolderName(e.target.value)}
-                  onKeyDown={(e) => handleCreateInputKeyDown(e, createFolder)}
-                />
+      <div className="mx-auto flex max-w-6xl flex-col gap-4 px-4 py-4 sm:px-6">
+        {(installPromptEvent || showIosInstallHint) && !isSidebarOpen ? (
+          <section className="rounded-[1.75rem] border border-neutral-200 bg-white px-5 py-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-sm font-medium text-neutral-950">安装体验</p>
+                <p className="mt-1 text-sm text-neutral-500">
+                  {installPromptEvent
+                    ? "这个版本已经补了 PWA 基础能力，可以直接安装到桌面或主屏幕。"
+                    : "iPhone 上请点浏览器分享按钮，再选“添加到主屏幕”。"}
+                </p>
+              </div>
+              {installPromptEvent ? (
                 <button
-                  className="inline-flex shrink-0 items-center gap-2 rounded-2xl bg-gray-900 px-4 py-3 text-sm text-white disabled:opacity-50"
+                  className="rounded-full bg-neutral-950 px-4 py-2 text-sm text-white"
                   type="button"
                   onClick={() => {
-                    void createFolder();
+                    void installApp();
                   }}
-                  disabled={!newFolderName.trim() || isCreatingFolder}
                 >
-                  <Plus size={16} />
-                  {isCreatingFolder ? "创建中" : "新建"}
+                  安装 Echo
                 </button>
-              </div>
-            ) : null}
+              ) : null}
+            </div>
           </section>
+        ) : null}
 
-          <section className="rounded-3xl border border-white/70 bg-white/85 p-4 shadow-[0_10px_40px_rgba(15,23,42,0.05)]">
-            <div className="mb-3 flex items-center gap-2 text-sm font-medium text-gray-700">
-              <Tag size={16} />
-              标签
-            </div>
-
-            <div className="space-y-2">
-              <button
-                className={`w-full rounded-2xl px-4 py-3 text-left text-sm transition ${
-                  activeTagId === "all"
-                    ? "bg-emerald-600 text-white"
-                    : "bg-gray-50 text-gray-600 hover:bg-emerald-50"
-                }`}
-                type="button"
-                onClick={() => setActiveTagId("all")}
-              >
-                全部标签
-              </button>
-              {allTags.map((tag) => (
-                <div
-                  key={tag.id}
-                  className="flex items-center gap-2 rounded-2xl px-3 py-2 text-white transition"
-                  style={{ backgroundColor: tag.color ?? "#2563eb" }}
-                >
-                  <button
-                    className="min-w-0 flex-1 px-1 py-1 text-left text-sm"
-                    type="button"
-                    onClick={() => setActiveTagId(tag.id)}
-                  >
-                    <span className="truncate">#{tag.name}</span>
-                  </button>
-                  <button
-                    className="rounded-full p-1 opacity-80 transition hover:bg-white/15 hover:opacity-100"
-                    type="button"
-                    onClick={() => {
-                      void deleteTag(tag);
-                    }}
-                    aria-label={`删除标签 ${tag.name}`}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-              ))}
-            </div>
-
-            {supportsTags ? (
-              <div className="mt-4 flex gap-2">
-                <input
-                  className="min-w-0 flex-1 rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-700 outline-none ring-0 focus:border-emerald-400"
-                  placeholder="新建标签"
-                  value={newTagName}
-                  onChange={(e) => setNewTagName(e.target.value)}
-                  onKeyDown={(e) => handleCreateInputKeyDown(e, createTag)}
-                />
-                <button
-                  className="inline-flex shrink-0 items-center gap-2 rounded-2xl bg-emerald-600 px-4 py-3 text-sm text-white disabled:opacity-50"
-                  type="button"
-                  onClick={() => {
-                    void createTag();
-                  }}
-                  disabled={!newTagName.trim() || isCreatingTag}
-                >
-                  <Plus size={16} />
-                  {isCreatingTag ? "创建中" : "新建"}
-                </button>
-              </div>
-            ) : null}
-          </section>
-
-          <section className="rounded-3xl border border-white/70 bg-white/85 p-4 shadow-[0_10px_40px_rgba(15,23,42,0.05)]">
-            <div className="mb-3 flex items-center gap-2 text-sm font-medium text-gray-700">
-              <Star size={16} />
-              自动标签规则
-            </div>
-
-            <p className="text-xs leading-6 text-gray-500">
-              {supportsAutoTagRules
-                ? "发送和编辑消息时会按下面的规则自动打标签，优先级越大越靠前。"
-                : "当前还是兼容旧版内置规则。执行最新 schema 后，这里就能直接配置。"}
-            </p>
-
-            <div className="mt-4 space-y-3">
-              {effectiveAutoTagRules.map((rule) => {
-                const isEditing = editingRuleId === rule.id && editingRuleDraft;
-
-                return (
-                  <div
-                    key={rule.id}
-                    className="rounded-2xl border border-gray-200 bg-gray-50 px-3 py-3"
-                  >
-                    {isEditing ? (
-                      <div className="space-y-3">
-                        <div className="grid gap-2 sm:grid-cols-2">
-                          <select
-                            className="rounded-2xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
-                            value={editingRuleDraft.tagId}
-                            onChange={(e) =>
-                              setEditingRuleDraft((current) =>
-                                current
-                                  ? {
-                                      ...current,
-                                      tagId: e.target.value,
-                                    }
-                                  : current,
-                              )
-                            }
-                          >
-                            {allTags.map((tag) => (
-                              <option key={tag.id} value={tag.id}>
-                                #{tag.name}
-                              </option>
-                            ))}
-                          </select>
-                          <select
-                            className="rounded-2xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
-                            value={editingRuleDraft.matchType}
-                            onChange={(e) =>
-                              setEditingRuleDraft((current) =>
-                                current
-                                  ? {
-                                      ...current,
-                                      matchType: e.target.value as AutoTagMatchType,
-                                      matchValue:
-                                        requiresMatchValue(e.target.value as AutoTagMatchType)
-                                          ? current.matchValue
-                                          : "",
-                                    }
-                                  : current,
-                              )
-                            }
-                          >
-                            {MATCH_TYPE_OPTIONS.map((option) => (
-                              <option key={option.value} value={option.value}>
-                                {option.label}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-
-                        <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_90px]">
-                          <input
-                            className="rounded-2xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
-                            placeholder={getRuleInputPlaceholder(editingRuleDraft.matchType)}
-                            value={editingRuleDraft.matchValue}
-                            onChange={(e) =>
-                              setEditingRuleDraft((current) =>
-                                current
-                                  ? {
-                                      ...current,
-                                      matchValue: e.target.value,
-                                    }
-                                  : current,
-                              )
-                            }
-                            disabled={!requiresMatchValue(editingRuleDraft.matchType)}
-                          />
-                          <input
-                            className="rounded-2xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
-                            placeholder="优先级"
-                            value={editingRuleDraft.priority}
-                            onChange={(e) =>
-                              setEditingRuleDraft((current) =>
-                                current
-                                  ? {
-                                      ...current,
-                                      priority: e.target.value,
-                                    }
-                                  : current,
-                              )
-                            }
-                          />
-                        </div>
-
-                        <div className="flex flex-wrap gap-2">
-                          <button
-                            className="rounded-full bg-blue-600 px-3 py-1.5 text-xs text-white disabled:opacity-50"
-                            type="button"
-                            onClick={() => {
-                              void saveEditedRule(rule.id);
-                            }}
-                            disabled={isSavingRule}
-                          >
-                            保存
-                          </button>
-                          <button
-                            className="rounded-full border border-gray-200 px-3 py-1.5 text-xs text-gray-600"
-                            type="button"
-                            onClick={cancelEditingRule}
-                          >
-                            取消
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="space-y-2">
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-2 text-xs">
-                              <span
-                                className="rounded-full px-2.5 py-1 font-medium"
-                                style={{
-                                  backgroundColor: `${rule.tag.color ?? "#2563eb"}20`,
-                                  color: rule.tag.color ?? "#2563eb",
-                                }}
-                              >
-                                #{rule.tag.name}
-                              </span>
-                              <span className="rounded-full bg-white px-2.5 py-1 text-gray-600">
-                                {MATCH_TYPE_OPTIONS.find((option) => option.value === rule.matchType)?.label}
-                              </span>
-                              <span className="rounded-full bg-white px-2.5 py-1 text-gray-500">
-                                P{rule.priority}
-                              </span>
-                            </div>
-                            <p className="mt-2 break-words text-xs leading-5 text-gray-500">
-                              {requiresMatchValue(rule.matchType)
-                                ? rule.matchValue
-                                : getRuleHelperText(rule.matchType)}
-                            </p>
-                          </div>
-                          {supportsAutoTagRules ? (
-                            <div className="flex shrink-0 items-center gap-1">
-                              <button
-                                className="rounded-full p-2 text-gray-500 transition hover:bg-white hover:text-blue-600"
-                                type="button"
-                                onClick={() => startEditingRule(rule)}
-                                aria-label="编辑规则"
-                              >
-                                <Pencil size={14} />
-                              </button>
-                              <button
-                                className="rounded-full p-2 text-gray-500 transition hover:bg-white hover:text-red-500 disabled:opacity-50"
-                                type="button"
-                                onClick={() => {
-                                  void deleteAutoTagRule(rule);
-                                }}
-                                disabled={isSavingRule}
-                                aria-label="删除规则"
-                              >
-                                <Trash2 size={14} />
-                              </button>
-                            </div>
-                          ) : null}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-
-            {supportsAutoTagRules && supportsTags ? (
-              <div className="mt-4 space-y-2 rounded-2xl border border-dashed border-gray-200 bg-white/80 p-3">
-                <div className="grid gap-2 sm:grid-cols-2">
-                  <select
-                    className="rounded-2xl border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
-                    value={newRuleTagId}
-                    onChange={(e) => setNewRuleTagId(e.target.value)}
-                  >
-                    {allTags.map((tag) => (
-                      <option key={tag.id} value={tag.id}>
-                        #{tag.name}
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    className="rounded-2xl border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
-                    value={newRuleMatchType}
-                    onChange={(e) => {
-                      const nextMatchType = e.target.value as AutoTagMatchType;
-                      setNewRuleMatchType(nextMatchType);
-
-                      if (!requiresMatchValue(nextMatchType)) {
-                        setNewRuleMatchValue("");
-                      }
-                    }}
-                  >
-                    {MATCH_TYPE_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_90px]">
-                  <input
-                    className="rounded-2xl border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
-                    placeholder={getRuleInputPlaceholder(newRuleMatchType)}
-                    value={newRuleMatchValue}
-                    onChange={(e) => setNewRuleMatchValue(e.target.value)}
-                    disabled={!requiresMatchValue(newRuleMatchType)}
-                  />
-                  <input
-                    className="rounded-2xl border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
-                    placeholder="优先级"
-                    value={newRulePriority}
-                    onChange={(e) => setNewRulePriority(e.target.value)}
-                  />
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-[11px] leading-5 text-gray-400">
-                    {getRuleHelperText(newRuleMatchType)}
-                  </p>
-                  <button
-                    className="inline-flex items-center gap-2 rounded-full bg-gray-900 px-4 py-2 text-xs text-white disabled:opacity-50"
-                    type="button"
-                    onClick={() => {
-                      void createAutoTagRule();
-                    }}
-                    disabled={isSavingRule || !newRuleTagId}
-                  >
-                    <Plus size={14} />
-                    新建规则
-                  </button>
-                </div>
-              </div>
-            ) : null}
-          </section>
-        </aside>
-
-        <section className="min-w-0 rounded-[2rem] border border-white/70 bg-white/70 shadow-[0_15px_50px_rgba(15,23,42,0.06)] backdrop-blur-xl">
-          <div className="border-b border-gray-100 px-5 py-4 sm:px-6">
+        <section className="flex min-h-[calc(100dvh-8.5rem)] flex-col overflow-hidden rounded-[2rem] border border-neutral-200 bg-white">
+          <div className="border-b border-neutral-200 px-4 py-4 sm:px-6">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-              <p className="text-sm text-gray-500">
-                {activeView === "all"
-                  ? "主列表"
-                  : activeView === "starred"
-                    ? "收藏"
-                    : "归档"}
-                {" · "}
-                {activeFolderId === "all"
-                  ? "全部消息"
-                  : `当前文件夹：${folders.find((folder) => folder.id === activeFolderId)?.name ?? "未命名"}`}
-                {activeTagId !== "all"
-                  ? ` · 标签：#${allTags.find((tag) => tag.id === activeTagId)?.name ?? ""}`
-                  : ""}
-                {debouncedSearchQuery
-                  ? ` · 搜索：${debouncedSearchQuery}`
-                  : ""}
-              </p>
+              <div className="space-y-2">
+                <p className="text-sm text-neutral-500">
+                  {activeView === "all"
+                    ? "主列表"
+                    : activeView === "starred"
+                      ? "收藏"
+                      : "归档"}
+                  {" · "}
+                  {activeFolderId === "all"
+                    ? "全部消息"
+                    : `当前文件夹：${folders.find((folder) => folder.id === activeFolderId)?.name ?? "未命名"}`}
+                  {activeTagId !== "all"
+                    ? ` · 标签：#${allTags.find((tag) => tag.id === activeTagId)?.name ?? ""}`
+                    : ""}
+                  {debouncedSearchQuery ? ` · 搜索：${debouncedSearchQuery}` : ""}
+                </p>
+                <p className="text-xs text-neutral-400">
+                  {currentSyncMode}
+                  {" · "}
+                  {supportsAutoTagRules
+                    ? "文件夹 / 标签 / 自动规则已启用"
+                    : supportsFolders
+                      ? "文件夹 / 标签结构已启用"
+                      : "兼容旧表结构"}
+                </p>
+              </div>
 
               <div className="flex flex-col gap-3 sm:items-end">
                 <div className="flex flex-wrap gap-2">
                   <button
-                    className={`rounded-full px-4 py-2 text-xs transition ${
+                    className={`rounded-full px-4 py-2 text-xs ${
                       activeView === "all"
-                        ? "bg-gray-900 text-white"
-                        : "border border-gray-200 bg-white text-gray-600 hover:border-gray-300"
+                        ? "bg-neutral-950 text-white"
+                        : "border border-neutral-200 bg-white text-neutral-600"
                     }`}
                     type="button"
                     onClick={() => setActiveView("all")}
@@ -1917,10 +2136,10 @@ export default function Home() {
                     全部
                   </button>
                   <button
-                    className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-xs transition ${
+                    className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-xs ${
                       activeView === "starred"
-                        ? "bg-amber-500 text-white"
-                        : "border border-amber-200 bg-white text-amber-600 hover:border-amber-300"
+                        ? "bg-neutral-950 text-white"
+                        : "border border-neutral-200 bg-white text-neutral-600"
                     }`}
                     type="button"
                     onClick={() => setActiveView("starred")}
@@ -1929,10 +2148,10 @@ export default function Home() {
                     收藏
                   </button>
                   <button
-                    className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-xs transition ${
+                    className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-xs ${
                       activeView === "archived"
-                        ? "bg-slate-700 text-white"
-                        : "border border-slate-200 bg-white text-slate-600 hover:border-slate-300"
+                        ? "bg-neutral-950 text-white"
+                        : "border border-neutral-200 bg-white text-neutral-600"
                     }`}
                     type="button"
                     onClick={() => setActiveView("archived")}
@@ -1942,17 +2161,17 @@ export default function Home() {
                   </button>
                 </div>
 
-                <label className="flex items-center gap-2 rounded-full border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-500">
+                <label className="flex items-center gap-2 rounded-full border border-neutral-200 bg-neutral-100 px-3 py-2 text-sm text-neutral-500">
                   <Search size={16} />
                   <input
-                    className="min-w-0 bg-transparent text-sm text-gray-700 outline-none placeholder:text-gray-400 sm:w-56"
+                    className="min-w-0 bg-transparent text-sm text-neutral-700 outline-none placeholder:text-neutral-400 sm:w-56"
                     placeholder={supportsServerSearch ? "搜索消息内容" : "搜索消息内容（本地匹配）"}
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                   />
                   {searchQuery ? (
                     <button
-                      className="rounded-full p-1 text-gray-400 transition hover:bg-gray-200 hover:text-gray-600"
+                      className="rounded-full p-1 text-neutral-400"
                       type="button"
                       onClick={() => setSearchQuery("")}
                       aria-label="清空搜索"
@@ -1965,8 +2184,20 @@ export default function Home() {
             </div>
           </div>
 
+          {error ? (
+            <div className="border-b border-neutral-200 bg-neutral-100 px-4 py-3 text-sm text-neutral-700 sm:px-6">
+              {error}
+            </div>
+          ) : null}
+
+          {notice ? (
+            <div className="border-b border-neutral-200 bg-white px-4 py-3 text-sm text-neutral-600 sm:px-6">
+              {notice}
+            </div>
+          ) : null}
+
           <div
-            className="h-[calc(100vh-19rem)] overflow-y-auto px-5 py-6 sm:px-6"
+            className="h-[calc(100dvh-21rem)] min-h-[16rem] overflow-y-auto px-4 py-5 sm:px-6"
             onScroll={(e) => {
               const target = e.currentTarget;
               const distanceToBottom =
@@ -1974,36 +2205,35 @@ export default function Home() {
               shouldScrollToBottomRef.current = distanceToBottom < 80;
             }}
           >
-            <div className="space-y-6">
+            <div className="space-y-5">
               {isLoading ? (
                 <div className="py-16 text-center">
-                  <div className="inline-block h-8 w-8 animate-spin rounded-full border-b-2 border-blue-600" />
-                  <p className="mt-4 text-gray-500">加载中...</p>
+                  <div className="mx-auto h-8 w-8 animate-spin rounded-full border-2 border-neutral-300 border-t-neutral-950" />
+                  <p className="mt-4 text-neutral-500">加载中...</p>
                 </div>
               ) : filteredNotes.length === 0 ? (
-                <div className="py-16 text-center text-gray-500">
+                <div className="py-16 text-center text-neutral-500">
                   这个视图里还没有消息，发一条试试看。
                 </div>
               ) : (
                 filteredNotes.map((note) => (
                   <article key={note.id} className="group">
                     <div className="flex gap-3">
-                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-500 to-cyan-500">
+                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl bg-neutral-950">
                         <span className="text-xs font-medium text-white">E</span>
                       </div>
-
                       <div className="min-w-0 flex-1">
-                        <div className="rounded-[1.5rem] rounded-tl-sm border border-gray-100 bg-white px-4 py-3 shadow-sm transition-shadow group-hover:shadow-md">
+                        <div className="rounded-[1.5rem] rounded-tl-sm border border-neutral-200 bg-neutral-50 px-4 py-3">
                           {editingNoteId === note.id ? (
                             <div className="space-y-3">
                               <textarea
-                                className="min-h-[110px] w-full resize-y rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 text-[15px] leading-7 text-gray-800 outline-none focus:ring-2 focus:ring-blue-500"
+                                className="min-h-[110px] w-full resize-y rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-[15px] leading-7 text-neutral-800 outline-none"
                                 value={editingContent}
                                 onChange={(e) => setEditingContent(e.target.value)}
                               />
                               <div className="flex flex-wrap gap-2">
                                 <button
-                                  className="inline-flex items-center gap-2 rounded-full bg-blue-600 px-4 py-2 text-xs text-white disabled:opacity-50"
+                                  className="inline-flex items-center gap-2 rounded-full bg-neutral-950 px-4 py-2 text-xs text-white disabled:opacity-50"
                                   type="button"
                                   onClick={() => {
                                     void saveEditedNote(note.id);
@@ -2014,7 +2244,7 @@ export default function Home() {
                                   保存修改
                                 </button>
                                 <button
-                                  className="inline-flex items-center gap-2 rounded-full border border-gray-200 px-4 py-2 text-xs text-gray-600"
+                                  className="inline-flex items-center gap-2 rounded-full border border-neutral-200 px-4 py-2 text-xs text-neutral-600"
                                   type="button"
                                   onClick={cancelEditingNote}
                                 >
@@ -2025,15 +2255,51 @@ export default function Home() {
                             </div>
                           ) : (
                             <div className="space-y-3">
-                              <p className="whitespace-pre-wrap break-words text-[15px] leading-7 text-gray-800">
-                                {note.content}
-                              </p>
+                              {note.content ? (
+                                <p className="whitespace-pre-wrap break-words text-[15px] leading-7 text-neutral-800">
+                                  {note.content}
+                                </p>
+                              ) : null}
+                              {note.fileUrl && note.fileName ? (
+                                <div className="space-y-3 rounded-2xl border border-neutral-200 bg-white p-3">
+                                  {note.fileType?.startsWith("image/") ? (
+                                    // eslint-disable-next-line @next/next/no-img-element
+                                    <img
+                                      className="max-h-72 w-full rounded-2xl object-cover"
+                                      src={note.fileUrl}
+                                      alt={note.fileName}
+                                    />
+                                  ) : null}
+                                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                                    <div className="min-w-0">
+                                      <p className="truncate text-sm font-medium text-neutral-900">
+                                        {note.fileName}
+                                      </p>
+                                      <p className="mt-1 text-xs text-neutral-500">
+                                        {note.fileType || "文件"}
+                                        {formatFileSize(note.fileSize)
+                                          ? ` · ${formatFileSize(note.fileSize)}`
+                                          : ""}
+                                      </p>
+                                    </div>
+                                    <a
+                                      className="inline-flex items-center justify-center rounded-full bg-neutral-950 px-4 py-2 text-xs text-white"
+                                      href={buildDownloadUrl(note.fileUrl, note.fileName)}
+                                      download={note.fileName}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                    >
+                                      下载文件
+                                    </a>
+                                  </div>
+                                </div>
+                              ) : null}
                               <div className="flex flex-wrap gap-2">
                                 <button
-                                  className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${
+                                  className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs ${
                                     note.isStarred
-                                      ? "border-amber-200 bg-amber-50 text-amber-600"
-                                      : "border-gray-200 text-gray-600 hover:border-amber-200 hover:text-amber-600"
+                                      ? "border-neutral-900 bg-neutral-900 text-white"
+                                      : "border-neutral-200 text-neutral-600"
                                   }`}
                                   type="button"
                                   onClick={() => {
@@ -2045,10 +2311,10 @@ export default function Home() {
                                   {note.isStarred ? "取消收藏" : "加入收藏"}
                                 </button>
                                 <button
-                                  className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${
+                                  className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs ${
                                     note.isArchived
-                                      ? "border-slate-200 bg-slate-100 text-slate-600"
-                                      : "border-gray-200 text-gray-600 hover:border-slate-300 hover:text-slate-700"
+                                      ? "border-neutral-900 bg-neutral-900 text-white"
+                                      : "border-neutral-200 text-neutral-600"
                                   }`}
                                   type="button"
                                   onClick={() => {
@@ -2060,7 +2326,7 @@ export default function Home() {
                                   {note.isArchived ? "取消归档" : "归档"}
                                 </button>
                                 <button
-                                  className="inline-flex items-center gap-2 rounded-full border border-gray-200 px-3 py-1.5 text-xs text-gray-600 transition hover:border-blue-300 hover:text-blue-600"
+                                  className="inline-flex items-center gap-2 rounded-full border border-neutral-200 px-3 py-1.5 text-xs text-neutral-600"
                                   type="button"
                                   onClick={() => startEditingNote(note)}
                                 >
@@ -2069,7 +2335,7 @@ export default function Home() {
                                 </button>
                                 {supportsSoftDelete ? (
                                   <button
-                                    className="inline-flex items-center gap-2 rounded-full border border-red-200 px-3 py-1.5 text-xs text-red-500 transition hover:border-red-300 hover:text-red-600 disabled:opacity-50"
+                                    className="inline-flex items-center gap-2 rounded-full border border-neutral-200 px-3 py-1.5 text-xs text-neutral-600 disabled:opacity-50"
                                     type="button"
                                     onClick={() => {
                                       void deleteNote(note);
@@ -2084,52 +2350,45 @@ export default function Home() {
                             </div>
                           )}
 
-                          {(note.folderName || note.tags.length > 0 || note.isStarred || note.isArchived) && (
+                          {(note.folderName || note.tags.length > 0 || note.isStarred || note.isArchived) ? (
                             <div className="mt-3 flex flex-wrap items-center gap-2">
                               {note.isStarred ? (
-                                <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-1 text-xs text-amber-600">
+                                <span className="inline-flex items-center gap-1 rounded-full bg-neutral-900 px-2.5 py-1 text-xs text-white">
                                   <Star size={12} className="fill-current" />
                                   收藏
                                 </span>
                               ) : null}
-
                               {note.isArchived ? (
-                                <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1 text-xs text-slate-600">
+                                <span className="inline-flex items-center gap-1 rounded-full bg-neutral-200 px-2.5 py-1 text-xs text-neutral-700">
                                   <Archive size={12} />
                                   已归档
                                 </span>
                               ) : null}
-
                               {note.folderName ? (
-                                <span className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2.5 py-1 text-xs text-gray-600">
+                                <span className="inline-flex items-center gap-1 rounded-full bg-neutral-200 px-2.5 py-1 text-xs text-neutral-700">
                                   <Folder size={12} />
                                   {note.folderName}
                                 </span>
                               ) : null}
-
                               {note.tags.map((tag) => (
                                 <span
                                   key={tag.id}
-                                  className="rounded-full px-2.5 py-1 text-xs"
-                                  style={{
-                                    backgroundColor: `${tag.color ?? "#60a5fa"}20`,
-                                    color: tag.color ?? "#2563eb",
-                                  }}
+                                  className="rounded-full bg-neutral-100 px-2.5 py-1 text-xs text-neutral-700"
                                 >
                                   #{tag.name}
                                 </span>
                               ))}
                             </div>
-                          )}
+                          ) : null}
 
-                          {(supportsFolders || supportsTags) && (
-                            <div className="mt-4 flex flex-col gap-3 border-t border-gray-100 pt-3">
+                          {(supportsFolders || supportsTags) ? (
+                            <div className="mt-4 flex flex-col gap-3 border-t border-neutral-200 pt-3">
                               {supportsFolders && folders.length > 0 ? (
                                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                                  <span className="text-xs text-gray-400">移动到文件夹</span>
+                                  <span className="text-xs text-neutral-400">移动到文件夹</span>
                                   <div className="flex gap-2">
                                     <select
-                                      className="rounded-full border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                      className="rounded-full border border-neutral-200 bg-white px-3 py-1.5 text-xs text-neutral-700 outline-none"
                                       value={noteFolderSelections[note.id] ?? note.folderId ?? ""}
                                       onChange={(e) =>
                                         setNoteFolderSelections((current) => ({
@@ -2146,7 +2405,7 @@ export default function Home() {
                                       ))}
                                     </select>
                                     <button
-                                      className="rounded-full border border-blue-200 px-3 py-1.5 text-xs text-blue-600 disabled:opacity-50"
+                                      className="rounded-full border border-neutral-200 px-3 py-1.5 text-xs text-neutral-700 disabled:opacity-50"
                                       type="button"
                                       onClick={() => {
                                         void moveNoteToFolder(note.id);
@@ -2158,13 +2417,12 @@ export default function Home() {
                                   </div>
                                 </div>
                               ) : null}
-
                               {supportsTags ? (
                                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                                  <span className="text-xs text-gray-400">添加标签</span>
+                                  <span className="text-xs text-neutral-400">添加标签</span>
                                   <div className="flex gap-2">
                                     <input
-                                      className="rounded-full border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs text-gray-700 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                                      className="rounded-full border border-neutral-200 bg-white px-3 py-1.5 text-xs text-neutral-700 outline-none"
                                       placeholder="输入标签名"
                                       value={noteTagInputs[note.id] ?? ""}
                                       onChange={(e) =>
@@ -2181,7 +2439,7 @@ export default function Home() {
                                       }}
                                     />
                                     <button
-                                      className="rounded-full border border-emerald-200 px-3 py-1.5 text-xs text-emerald-600 disabled:opacity-50"
+                                      className="rounded-full border border-neutral-200 px-3 py-1.5 text-xs text-neutral-700 disabled:opacity-50"
                                       type="button"
                                       onClick={() => {
                                         void assignTagToNote(note.id);
@@ -2197,10 +2455,9 @@ export default function Home() {
                                 </div>
                               ) : null}
                             </div>
-                          )}
+                          ) : null}
                         </div>
-
-                        <div className="mt-2 px-1 text-xs text-gray-400">
+                        <div className="mt-2 px-1 text-xs text-neutral-400">
                           {format(new Date(note.createdAt), "MM-dd HH:mm", { locale: zhCN })}
                         </div>
                       </div>
@@ -2212,14 +2469,14 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="border-t border-gray-100 bg-white/90 px-5 py-4 sm:px-6">
+          <div className="border-t border-neutral-200 bg-white px-4 py-4 pb-[calc(env(safe-area-inset-bottom)+1rem)] sm:px-6">
             <div className="space-y-3">
               {supportsFolders && folders.length > 0 ? (
-                <div className="flex flex-wrap items-center gap-2 text-sm text-gray-500">
+                <div className="flex flex-wrap items-center gap-2 text-sm text-neutral-500">
                   <Folder size={16} />
                   <span>发送到</span>
                   <select
-                    className="rounded-full border border-gray-200 bg-gray-50 px-3 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="rounded-full border border-neutral-200 bg-neutral-100 px-3 py-1.5 text-sm text-neutral-700 outline-none"
                     value={selectedFolderId}
                     onChange={(e) => setSelectedFolderId(e.target.value)}
                   >
@@ -2232,42 +2489,78 @@ export default function Home() {
                 </div>
               ) : null}
 
-              <div className="flex gap-3">
+              {pendingFile ? (
+                <div className="flex items-center justify-between gap-3 rounded-2xl border border-neutral-200 bg-neutral-100 px-4 py-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium text-neutral-900">{pendingFile.name}</p>
+                    <p className="mt-1 text-xs text-neutral-500">
+                      {pendingFile.type || "文件"}
+                      {formatFileSize(pendingFile.size)
+                        ? ` · ${formatFileSize(pendingFile.size)}`
+                        : ""}
+                    </p>
+                  </div>
+                  <button
+                    className="rounded-full border border-neutral-200 bg-white p-2 text-neutral-500"
+                    type="button"
+                    onClick={() => setPendingFile(null)}
+                    aria-label="移除附件"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              ) : null}
+
+              <div className="flex items-end gap-3">
                 <div className="flex-1">
+                  <input
+                    ref={fileInputRef}
+                    className="hidden"
+                    type="file"
+                    onChange={handleFileInputChange}
+                  />
                   <textarea
-                    className="min-h-[48px] max-h-40 w-full resize-none rounded-[1.5rem] border border-gray-200 bg-gray-50 px-4 py-3 text-gray-800 outline-none focus:ring-2 focus:ring-blue-500"
+                    className="min-h-[52px] max-h-40 w-full resize-none rounded-[1.5rem] border border-neutral-200 bg-neutral-100 px-4 py-3 text-neutral-800 outline-none"
                     placeholder="输入文本内容..."
                     rows={1}
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyDown={handleComposerKeyDown}
+                    onPaste={handleComposerPaste}
                     onInput={(e) => {
                       const target = e.target as HTMLTextAreaElement;
                       target.style.height = "auto";
                       target.style.height = `${target.scrollHeight}px`;
                     }}
                   />
-                  <p className="mt-2 px-1 text-xs text-gray-400">
+                  <p className="mt-2 px-1 text-xs text-neutral-400">
                     {supportsAutoTagRules
-                      ? "会按你在左侧配置的规则自动打标签。"
-                      : `现在会自动识别部分内容并打标签，比如${FALLBACK_AUTO_TAG_NAMES.join("、")}。`}
+                      ? "支持粘贴图片、选择文件，并按你在侧边栏配置的规则自动打标签。"
+                      : `支持粘贴图片、选择文件，现在也会自动识别部分内容并打标签，比如${FALLBACK_AUTO_TAG_NAMES.join("、")}。`}
                   </p>
                 </div>
-
                 <div className="flex items-end">
-                  <button
-                    className="inline-flex h-12 items-center gap-2 rounded-[1.25rem] bg-gradient-to-r from-blue-600 to-cyan-500 px-5 font-medium text-white transition disabled:cursor-not-allowed disabled:opacity-50"
-                    type="button"
-                    onClick={() => {
-                      void handleSend();
-                    }}
-                    disabled={!input.trim() || isSending}
-                  >
-                    <Send size={18} />
-                    <span className="hidden sm:inline">
-                      {isSending ? "发送中..." : "发送"}
-                    </span>
-                  </button>
+                  <div className="flex gap-2">
+                    <button
+                      className="inline-flex h-12 items-center gap-2 rounded-[1.25rem] border border-neutral-200 bg-white px-4 font-medium text-neutral-700"
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                    >
+                      <Plus size={18} />
+                      <span className="hidden sm:inline">文件</span>
+                    </button>
+                    <button
+                      className="inline-flex h-12 items-center gap-2 rounded-[1.25rem] bg-neutral-950 px-5 font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+                      type="button"
+                      onClick={() => {
+                        void handleSend();
+                      }}
+                      disabled={(!input.trim() && !pendingFile) || isSending}
+                    >
+                      <Send size={18} />
+                      <span className="hidden sm:inline">{isSending ? "发送中..." : "发送"}</span>
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
