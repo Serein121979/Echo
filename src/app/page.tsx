@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getSupabaseClient, supabaseConfigError } from "@/utils/supabase/client";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
-import { Folder, Pencil, Plus, Search, Send, Tag, Trash2, X } from "lucide-react";
+import { Archive, Folder, Pencil, Plus, Search, Send, Star, Tag, Trash2, X } from "lucide-react";
 
 type FolderItem = {
   id: string;
@@ -23,10 +23,23 @@ type NoteRow = {
   created_at: string;
   folder_id?: string | null;
   deleted_at?: string | null;
+  is_starred?: boolean;
+  is_archived?: boolean;
 };
 
 type NoteTagRow = {
   note_id: string;
+  tag: TagItem | TagItem[] | null;
+};
+
+type AutoTagMatchType = "contains" | "regex" | "url" | "phone" | "min_length" | "line_breaks";
+
+type AutoTagRuleRow = {
+  id: string;
+  match_type: AutoTagMatchType;
+  match_value: string | null;
+  priority: number;
+  tag_id: string;
   tag: TagItem | TagItem[] | null;
 };
 
@@ -37,6 +50,17 @@ type Note = {
   folderId: string | null;
   folderName: string | null;
   tags: TagItem[];
+  isStarred: boolean;
+  isArchived: boolean;
+};
+
+type AutoTagRule = {
+  id: string;
+  matchType: AutoTagMatchType;
+  matchValue: string;
+  priority: number;
+  tagId: string;
+  tag: TagItem;
 };
 
 const FETCH_TIMEOUT_MS = 8000;
@@ -49,7 +73,43 @@ const TAG_COLORS = {
   长文: "#db2777",
   电话: "#0f766e",
 } as const;
-const AUTO_TAG_NAMES = Object.keys(TAG_COLORS);
+
+const DEFAULT_AUTO_TAG_RULES = [
+  { tagName: "链接", matchType: "url", matchValue: "", priority: 100 },
+  { tagName: "待办", matchType: "contains", matchValue: "todo", priority: 100 },
+  { tagName: "待办", matchType: "contains", matchValue: "待办", priority: 90 },
+  { tagName: "待办", matchType: "contains", matchValue: "待处理", priority: 80 },
+  { tagName: "待办", matchType: "contains", matchValue: "follow up", priority: 70 },
+  { tagName: "待办", matchType: "contains", matchValue: "follow-up", priority: 60 },
+  {
+    tagName: "代码",
+    matchType: "regex",
+    matchValue: "```|function |const |let |var |=>|class |import |export ",
+    priority: 100,
+  },
+  { tagName: "清单", matchType: "regex", matchValue: "^[-*]\\s", priority: 100 },
+  { tagName: "清单", matchType: "line_breaks", matchValue: "2", priority: 90 },
+  { tagName: "长文", matchType: "min_length", matchValue: "120", priority: 100 },
+  { tagName: "电话", matchType: "phone", matchValue: "", priority: 100 },
+] as const satisfies ReadonlyArray<{
+  tagName: keyof typeof TAG_COLORS;
+  matchType: AutoTagMatchType;
+  matchValue: string;
+  priority: number;
+}>;
+
+const FALLBACK_AUTO_TAG_NAMES = Array.from(
+  new Set(DEFAULT_AUTO_TAG_RULES.map((rule) => rule.tagName)),
+);
+
+const MATCH_TYPE_OPTIONS: Array<{ value: AutoTagMatchType; label: string; hint: string }> = [
+  { value: "contains", label: "关键词", hint: "包含指定文本时命中" },
+  { value: "regex", label: "正则", hint: "使用正则表达式匹配" },
+  { value: "url", label: "链接", hint: "内容里出现 URL 时命中" },
+  { value: "phone", label: "电话", hint: "内容里出现手机号时命中" },
+  { value: "min_length", label: "最短字数", hint: "内容长度达到阈值时命中" },
+  { value: "line_breaks", label: "换行数", hint: "换行数达到阈值时命中" },
+];
 
 type FetchNotesResult = {
   data: NoteRow[];
@@ -81,32 +141,80 @@ function getTagColor(name: string, currentCount: number) {
   return palette[currentCount % palette.length];
 }
 
-function inferAutoTags(content: string) {
-  const next = new Set<string>();
+function getRuleHelperText(matchType: AutoTagMatchType) {
+  return MATCH_TYPE_OPTIONS.find((option) => option.value === matchType)?.hint ?? "";
+}
+
+function getRuleInputPlaceholder(matchType: AutoTagMatchType) {
+  switch (matchType) {
+    case "contains":
+      return "例如：待办";
+    case "regex":
+      return "例如：^[-*]\\s";
+    case "min_length":
+      return "例如：120";
+    case "line_breaks":
+      return "例如：2";
+    case "url":
+    case "phone":
+      return "此类型无需填写";
+    default:
+      return "";
+  }
+}
+
+function requiresMatchValue(matchType: AutoTagMatchType) {
+  return matchType === "contains" || matchType === "regex" || matchType === "min_length" || matchType === "line_breaks";
+}
+
+function parseRuleNumber(value: string) {
+  const parsed = Number.parseInt(value.trim(), 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function matchesAutoTagRule(content: string, rule: Pick<AutoTagRule, "matchType" | "matchValue"> | {
+  matchType: AutoTagMatchType;
+  matchValue: string;
+}) {
   const text = content.trim();
 
-  if (/https?:\/\//i.test(text)) {
-    next.add("链接");
-  }
+  switch (rule.matchType) {
+    case "contains":
+      return rule.matchValue.length > 0 && text.toLowerCase().includes(rule.matchValue.toLowerCase());
+    case "regex":
+      if (!rule.matchValue) {
+        return false;
+      }
 
-  if (/(todo|待办|待处理|follow up|follow-up)/i.test(text)) {
-    next.add("待办");
+      try {
+        return new RegExp(rule.matchValue, "im").test(text);
+      } catch {
+        return false;
+      }
+    case "url":
+      return /https?:\/\//i.test(text);
+    case "phone":
+      return /\b1\d{10}\b/.test(text);
+    case "min_length": {
+      const threshold = parseRuleNumber(rule.matchValue);
+      return threshold !== null && text.length >= threshold;
+    }
+    case "line_breaks": {
+      const threshold = parseRuleNumber(rule.matchValue);
+      return threshold !== null && (text.match(/\n/g) ?? []).length >= threshold;
+    }
+    default:
+      return false;
   }
+}
 
-  if (/```|function |const |let |var |=>|class |import |export /i.test(text)) {
-    next.add("代码");
-  }
+function inferAutoTags(content: string, rules: AutoTagRule[]) {
+  const next = new Set<string>();
 
-  if ((text.match(/\n/g) ?? []).length >= 2 || /^[-*]\s/m.test(text)) {
-    next.add("清单");
-  }
-
-  if (text.length >= 120) {
-    next.add("长文");
-  }
-
-  if (/\b1\d{10}\b/.test(text)) {
-    next.add("电话");
+  for (const rule of rules) {
+    if (matchesAutoTagRule(content, rule)) {
+      next.add(rule.tag.name);
+    }
   }
 
   return Array.from(next);
@@ -150,7 +258,7 @@ async function fetchNotes(searchQuery: string): Promise<FetchNotesResult> {
   const normalizedSearch = searchQuery.trim();
   const latestShape = await buildNotesQuery(
     supabase,
-    "id, content, created_at, folder_id, deleted_at",
+    "id, content, created_at, folder_id, deleted_at, is_starred, is_archived",
     normalizedSearch,
     normalizedSearch.length > 0,
   );
@@ -175,7 +283,7 @@ async function fetchNotes(searchQuery: string): Promise<FetchNotesResult> {
 
   const withoutSearchVector = await buildNotesQuery(
     supabase,
-    "id, content, created_at, folder_id, deleted_at",
+    "id, content, created_at, folder_id, deleted_at, is_starred, is_archived",
     normalizedSearch,
     false,
   );
@@ -230,6 +338,8 @@ async function fetchNotes(searchQuery: string): Promise<FetchNotesResult> {
     data: asNoteRows(legacyShape.data).map((note) => ({
       ...note,
       folder_id: null,
+      is_starred: false,
+      is_archived: false,
     })),
     error: legacyShape.error,
     supportsSoftDelete: false,
@@ -329,25 +439,71 @@ async function fetchTags() {
   };
 }
 
+async function fetchAutoTagRules() {
+  const supabase = getSupabaseClient();
+
+  if (!supabase) {
+    return {
+      data: [] as AutoTagRuleRow[],
+      error: { message: supabaseConfigError ?? "Supabase 客户端初始化失败" },
+      enabled: false,
+    };
+  }
+
+  const result = await supabase
+    .from("auto_tag_rules")
+    .select("id, match_type, match_value, priority, tag_id, tag:tags(id, name, color)")
+    .order("priority", { ascending: false })
+    .order("created_at", { ascending: true });
+
+  if (result.error && isMissingTableError(result.error.code)) {
+    return {
+      data: [] as AutoTagRuleRow[],
+      error: null,
+      enabled: false,
+    };
+  }
+
+  return {
+    data: (result.data ?? []) as AutoTagRuleRow[],
+    error: result.error,
+    enabled: !result.error,
+  };
+}
+
 export default function Home() {
   const [input, setInput] = useState("");
   const [notes, setNotes] = useState<Note[]>([]);
   const [folders, setFolders] = useState<FolderItem[]>([]);
   const [allTags, setAllTags] = useState<TagItem[]>([]);
+  const [autoTagRules, setAutoTagRules] = useState<AutoTagRule[]>([]);
   const [activeFolderId, setActiveFolderId] = useState("all");
   const [activeTagId, setActiveTagId] = useState("all");
+  const [activeView, setActiveView] = useState<"all" | "starred" | "archived">("all");
   const [selectedFolderId, setSelectedFolderId] = useState("");
   const [newFolderName, setNewFolderName] = useState("");
   const [newTagName, setNewTagName] = useState("");
+  const [newRuleTagId, setNewRuleTagId] = useState("");
+  const [newRuleMatchType, setNewRuleMatchType] = useState<AutoTagMatchType>("contains");
+  const [newRuleMatchValue, setNewRuleMatchValue] = useState("");
+  const [newRulePriority, setNewRulePriority] = useState("100");
   const [noteTagInputs, setNoteTagInputs] = useState<Record<string, string>>({});
   const [noteFolderSelections, setNoteFolderSelections] = useState<Record<string, string>>(
     {},
   );
+  const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
+  const [editingRuleDraft, setEditingRuleDraft] = useState<{
+    tagId: string;
+    matchType: AutoTagMatchType;
+    matchValue: string;
+    priority: string;
+  } | null>(null);
   const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
   const [editingContent, setEditingContent] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   const [isCreatingTag, setIsCreatingTag] = useState(false);
+  const [isSavingRule, setIsSavingRule] = useState(false);
   const [noteActionId, setNoteActionId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -355,6 +511,7 @@ export default function Home() {
   const [syncMode, setSyncMode] = useState("轮询兜底中");
   const [supportsFolders, setSupportsFolders] = useState(false);
   const [supportsTags, setSupportsTags] = useState(false);
+  const [supportsAutoTagRules, setSupportsAutoTagRules] = useState(false);
   const [supportsSoftDelete, setSupportsSoftDelete] = useState(false);
   const [supportsServerSearch, setSupportsServerSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -364,6 +521,28 @@ export default function Home() {
   const prevNoteCountRef = useRef(0);
   const shouldScrollToBottomRef = useRef(true);
   const currentSyncMode = supabaseConfigError ? "Supabase 未配置" : syncMode;
+  const effectiveAutoTagRules = useMemo<AutoTagRule[]>(
+    () =>
+      supportsAutoTagRules
+        ? autoTagRules
+        : DEFAULT_AUTO_TAG_RULES.map((rule, index) => ({
+            id: `fallback-${index}`,
+            matchType: rule.matchType,
+            matchValue: rule.matchValue,
+            priority: rule.priority,
+            tagId: rule.tagName,
+            tag: {
+              id: rule.tagName,
+              name: rule.tagName,
+              color: TAG_COLORS[rule.tagName],
+            },
+          })),
+    [autoTagRules, supportsAutoTagRules],
+  );
+  const autoTagNameSet = useMemo(
+    () => new Set(effectiveAutoTagRules.map((rule) => normalizeName(rule.tag.name))),
+    [effectiveAutoTagRules],
+  );
 
   useEffect(() => {
     const timeoutId = window.setTimeout(() => {
@@ -393,14 +572,16 @@ export default function Home() {
         fetchFolders(),
         fetchNoteTags(),
         fetchTags(),
+        fetchAutoTagRules(),
       ]);
-      const [notesResult, foldersResult, noteTagsResult, tagsResult] =
+      const [notesResult, foldersResult, noteTagsResult, tagsResult, autoTagRulesResult] =
         await Promise.race([request, timeout]);
 
       if (notesResult.error) throw notesResult.error;
       if (foldersResult.error) throw foldersResult.error;
       if (noteTagsResult.error) throw noteTagsResult.error;
       if (tagsResult.error) throw tagsResult.error;
+      if (autoTagRulesResult.error) throw autoTagRulesResult.error;
 
       const nextFolders = foldersResult.data;
       const folderMap = new Map(nextFolders.map((folder) => [folder.id, folder.name]));
@@ -423,12 +604,32 @@ export default function Home() {
         folderId: note.folder_id ?? null,
         folderName: note.folder_id ? folderMap.get(note.folder_id) ?? null : null,
         tags: tagsByNoteId.get(note.id) ?? [],
+        isStarred: note.is_starred ?? false,
+        isArchived: note.is_archived ?? false,
       }));
+      const nextAutoTagRules = autoTagRulesResult.data.flatMap((rule) => {
+        const rawTag = Array.isArray(rule.tag) ? rule.tag[0] : rule.tag;
+
+        if (!rawTag) {
+          return [];
+        }
+
+        return [{
+          id: rule.id,
+          matchType: rule.match_type,
+          matchValue: rule.match_value ?? "",
+          priority: rule.priority,
+          tagId: rule.tag_id,
+          tag: rawTag,
+        }];
+      });
 
       setFolders(nextFolders);
       setAllTags(tagsResult.data);
+      setAutoTagRules(nextAutoTagRules);
       setSupportsFolders(foldersResult.enabled);
       setSupportsTags(noteTagsResult.enabled && tagsResult.enabled);
+      setSupportsAutoTagRules(autoTagRulesResult.enabled);
       setSupportsSoftDelete(notesResult.supportsSoftDelete);
       setSupportsServerSearch(notesResult.supportsServerSearch);
       setNotes(nextNotes);
@@ -450,6 +651,11 @@ export default function Home() {
         if (tagsResult.data.some((tag) => tag.id === current)) return current;
         return "all";
       });
+      setNewRuleTagId((current) => {
+        if (!autoTagRulesResult.enabled || tagsResult.data.length === 0) return "";
+        if (current && tagsResult.data.some((tag) => tag.id === current)) return current;
+        return tagsResult.data[0].id;
+      });
 
       setNoteFolderSelections((current) => {
         const nextSelections = { ...current };
@@ -464,8 +670,10 @@ export default function Home() {
       setNotes([]);
       setFolders([]);
       setAllTags([]);
+      setAutoTagRules([]);
       setSupportsFolders(false);
       setSupportsTags(false);
+      setSupportsAutoTagRules(false);
       setSupportsSoftDelete(false);
       setSupportsServerSearch(false);
       setError(error instanceof Error ? error.message : "加载失败，请稍后重试");
@@ -553,10 +761,10 @@ export default function Home() {
       }
 
       const note = notes.find((item) => item.id === noteId);
-      const desiredNames = inferAutoTags(content).map(normalizeName);
+      const desiredNames = inferAutoTags(content, effectiveAutoTagRules).map(normalizeName);
       const desiredSet = new Set(desiredNames);
       const currentAutoTags = (note?.tags ?? []).filter((tag) =>
-        AUTO_TAG_NAMES.map(normalizeName).includes(normalizeName(tag.name)),
+        autoTagNameSet.has(normalizeName(tag.name)),
       );
 
       for (const tag of currentAutoTags) {
@@ -575,7 +783,7 @@ export default function Home() {
 
       await applyTagsToNote(noteId, Array.from(desiredSet));
     },
-    [applyTagsToNote, notes, supportsTags],
+    [applyTagsToNote, autoTagNameSet, effectiveAutoTagRules, notes, supportsTags],
   );
 
   useEffect(() => {
@@ -605,6 +813,9 @@ export default function Home() {
         void fetchAppData();
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "note_tags" }, () => {
+        void fetchAppData();
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "auto_tag_rules" }, () => {
         void fetchAppData();
       })
       .subscribe((status) => {
@@ -650,6 +861,12 @@ export default function Home() {
     const normalizedSearch = debouncedSearchQuery.toLowerCase();
 
     return notes.filter((note) => {
+      const matchesView =
+        activeView === "archived"
+          ? note.isArchived
+          : activeView === "starred"
+            ? note.isStarred && !note.isArchived
+            : !note.isArchived;
       const matchesFolder = activeFolderId === "all" || note.folderId === activeFolderId;
       const matchesTag =
         activeTagId === "all" || note.tags.some((tag) => tag.id === activeTagId);
@@ -658,9 +875,9 @@ export default function Home() {
         supportsServerSearch ||
         note.content.toLowerCase().includes(normalizedSearch);
 
-      return matchesFolder && matchesTag && matchesSearch;
+      return matchesView && matchesFolder && matchesTag && matchesSearch;
     });
-  }, [activeFolderId, activeTagId, debouncedSearchQuery, notes, supportsServerSearch]);
+  }, [activeFolderId, activeTagId, activeView, debouncedSearchQuery, notes, supportsServerSearch]);
 
   const createFolder = async () => {
     const name = newFolderName.trim();
@@ -778,6 +995,66 @@ export default function Home() {
       await fetchAppData();
     } catch (error) {
       setError(error instanceof Error ? error.message : "移动文件夹失败");
+    } finally {
+      setNoteActionId(null);
+    }
+  };
+
+  const toggleNoteStar = async (note: Note) => {
+    if (noteActionId) return;
+
+    setNoteActionId(note.id);
+    setError(null);
+    setNotice(null);
+
+    try {
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+      }
+
+      const { error } = await supabase
+        .from("notes")
+        .update({ is_starred: !note.isStarred })
+        .eq("id", note.id);
+
+      if (error) throw error;
+
+      setNotice(note.isStarred ? "已取消收藏。" : "已加入收藏。");
+      await fetchAppData();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "更新收藏状态失败");
+    } finally {
+      setNoteActionId(null);
+    }
+  };
+
+  const toggleNoteArchived = async (note: Note) => {
+    if (noteActionId) return;
+
+    setNoteActionId(note.id);
+    setError(null);
+    setNotice(null);
+
+    try {
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+      }
+
+      const { error } = await supabase
+        .from("notes")
+        .update({ is_archived: !note.isArchived })
+        .eq("id", note.id);
+
+      if (error) throw error;
+
+      setNotice(note.isArchived ? "已恢复到主列表。" : "已归档消息。");
+      await fetchAppData();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "更新归档状态失败");
     } finally {
       setNoteActionId(null);
     }
@@ -908,6 +1185,165 @@ export default function Home() {
     }
   };
 
+  const createAutoTagRule = async () => {
+    if (!supportsAutoTagRules || isSavingRule) return;
+
+    const tagId = newRuleTagId;
+    const priority = parseRuleNumber(newRulePriority);
+    const matchValue = newRuleMatchValue.trim();
+
+    if (!tagId) {
+      setError("请先选择规则对应的标签。");
+      return;
+    }
+
+    if (priority === null) {
+      setError("优先级需要是整数。");
+      return;
+    }
+
+    if (requiresMatchValue(newRuleMatchType) && !matchValue) {
+      setError("这个规则类型需要填写匹配值。");
+      return;
+    }
+
+    setIsSavingRule(true);
+    setError(null);
+    setNotice(null);
+
+    try {
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+      }
+
+      const { error } = await supabase.from("auto_tag_rules").insert([{
+        tag_id: tagId,
+        match_type: newRuleMatchType,
+        match_value: requiresMatchValue(newRuleMatchType) ? matchValue : null,
+        priority,
+      }]);
+
+      if (error) throw error;
+
+      setNewRuleMatchValue("");
+      setNewRulePriority("100");
+      setNotice("自动标签规则已创建。");
+      await fetchAppData();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "创建自动标签规则失败");
+    } finally {
+      setIsSavingRule(false);
+    }
+  };
+
+  const startEditingRule = (rule: AutoTagRule) => {
+    setEditingRuleId(rule.id);
+    setEditingRuleDraft({
+      tagId: rule.tagId,
+      matchType: rule.matchType,
+      matchValue: rule.matchValue,
+      priority: String(rule.priority),
+    });
+    setError(null);
+    setNotice(null);
+  };
+
+  const cancelEditingRule = () => {
+    setEditingRuleId(null);
+    setEditingRuleDraft(null);
+  };
+
+  const saveEditedRule = async (ruleId: string) => {
+    if (!supportsAutoTagRules || isSavingRule || !editingRuleDraft) return;
+
+    const priority = parseRuleNumber(editingRuleDraft.priority);
+    const matchValue = editingRuleDraft.matchValue.trim();
+
+    if (!editingRuleDraft.tagId) {
+      setError("请先选择规则对应的标签。");
+      return;
+    }
+
+    if (priority === null) {
+      setError("优先级需要是整数。");
+      return;
+    }
+
+    if (requiresMatchValue(editingRuleDraft.matchType) && !matchValue) {
+      setError("这个规则类型需要填写匹配值。");
+      return;
+    }
+
+    setIsSavingRule(true);
+    setError(null);
+    setNotice(null);
+
+    try {
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+      }
+
+      const { error } = await supabase
+        .from("auto_tag_rules")
+        .update({
+          tag_id: editingRuleDraft.tagId,
+          match_type: editingRuleDraft.matchType,
+          match_value: requiresMatchValue(editingRuleDraft.matchType) ? matchValue : null,
+          priority,
+        })
+        .eq("id", ruleId);
+
+      if (error) throw error;
+
+      cancelEditingRule();
+      setNotice("自动标签规则已更新。");
+      await fetchAppData();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "更新自动标签规则失败");
+    } finally {
+      setIsSavingRule(false);
+    }
+  };
+
+  const deleteAutoTagRule = async (rule: AutoTagRule) => {
+    if (!supportsAutoTagRules || isSavingRule) return;
+
+    const confirmed = window.confirm(`确定删除规则“${rule.tag.name} · ${getRuleHelperText(rule.matchType)}”吗？`);
+
+    if (!confirmed) return;
+
+    setIsSavingRule(true);
+    setError(null);
+    setNotice(null);
+
+    try {
+      const supabase = getSupabaseClient();
+
+      if (!supabase) {
+        throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
+      }
+
+      const { error } = await supabase.from("auto_tag_rules").delete().eq("id", rule.id);
+
+      if (error) throw error;
+
+      if (editingRuleId === rule.id) {
+        cancelEditingRule();
+      }
+
+      setNotice("自动标签规则已删除。");
+      await fetchAppData();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "删除自动标签规则失败");
+    } finally {
+      setIsSavingRule(false);
+    }
+  };
+
   const startEditingNote = (note: Note) => {
     setEditingNoteId(note.id);
     setEditingContent(note.content);
@@ -988,7 +1424,7 @@ export default function Home() {
       setInput("");
 
       if (supportsTags && data?.id) {
-        const autoTags = inferAutoTags(content);
+        const autoTags = inferAutoTags(content, effectiveAutoTagRules);
         await applyTagsToNote(data.id as string, autoTags);
       }
 
@@ -1030,7 +1466,11 @@ export default function Home() {
           <div className="text-right text-xs text-gray-400">
             <div>{currentSyncMode}</div>
             <div className="mt-1">
-              {supportsFolders ? "文件夹 / 标签结构已启用" : "兼容旧表结构"}
+              {supportsAutoTagRules
+                ? "文件夹 / 标签 / 自动规则已启用"
+                : supportsFolders
+                  ? "文件夹 / 标签结构已启用"
+                  : "兼容旧表结构"}
             </div>
           </div>
         </div>
@@ -1190,12 +1630,268 @@ export default function Home() {
               </div>
             ) : null}
           </section>
+
+          <section className="rounded-3xl border border-white/70 bg-white/85 p-4 shadow-[0_10px_40px_rgba(15,23,42,0.05)]">
+            <div className="mb-3 flex items-center gap-2 text-sm font-medium text-gray-700">
+              <Star size={16} />
+              自动标签规则
+            </div>
+
+            <p className="text-xs leading-6 text-gray-500">
+              {supportsAutoTagRules
+                ? "发送和编辑消息时会按下面的规则自动打标签，优先级越大越靠前。"
+                : "当前还是兼容旧版内置规则。执行最新 schema 后，这里就能直接配置。"}
+            </p>
+
+            <div className="mt-4 space-y-3">
+              {effectiveAutoTagRules.map((rule) => {
+                const isEditing = editingRuleId === rule.id && editingRuleDraft;
+
+                return (
+                  <div
+                    key={rule.id}
+                    className="rounded-2xl border border-gray-200 bg-gray-50 px-3 py-3"
+                  >
+                    {isEditing ? (
+                      <div className="space-y-3">
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          <select
+                            className="rounded-2xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
+                            value={editingRuleDraft.tagId}
+                            onChange={(e) =>
+                              setEditingRuleDraft((current) =>
+                                current
+                                  ? {
+                                      ...current,
+                                      tagId: e.target.value,
+                                    }
+                                  : current,
+                              )
+                            }
+                          >
+                            {allTags.map((tag) => (
+                              <option key={tag.id} value={tag.id}>
+                                #{tag.name}
+                              </option>
+                            ))}
+                          </select>
+                          <select
+                            className="rounded-2xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
+                            value={editingRuleDraft.matchType}
+                            onChange={(e) =>
+                              setEditingRuleDraft((current) =>
+                                current
+                                  ? {
+                                      ...current,
+                                      matchType: e.target.value as AutoTagMatchType,
+                                      matchValue:
+                                        requiresMatchValue(e.target.value as AutoTagMatchType)
+                                          ? current.matchValue
+                                          : "",
+                                    }
+                                  : current,
+                              )
+                            }
+                          >
+                            {MATCH_TYPE_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_90px]">
+                          <input
+                            className="rounded-2xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
+                            placeholder={getRuleInputPlaceholder(editingRuleDraft.matchType)}
+                            value={editingRuleDraft.matchValue}
+                            onChange={(e) =>
+                              setEditingRuleDraft((current) =>
+                                current
+                                  ? {
+                                      ...current,
+                                      matchValue: e.target.value,
+                                    }
+                                  : current,
+                              )
+                            }
+                            disabled={!requiresMatchValue(editingRuleDraft.matchType)}
+                          />
+                          <input
+                            className="rounded-2xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
+                            placeholder="优先级"
+                            value={editingRuleDraft.priority}
+                            onChange={(e) =>
+                              setEditingRuleDraft((current) =>
+                                current
+                                  ? {
+                                      ...current,
+                                      priority: e.target.value,
+                                    }
+                                  : current,
+                              )
+                            }
+                          />
+                        </div>
+
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            className="rounded-full bg-blue-600 px-3 py-1.5 text-xs text-white disabled:opacity-50"
+                            type="button"
+                            onClick={() => {
+                              void saveEditedRule(rule.id);
+                            }}
+                            disabled={isSavingRule}
+                          >
+                            保存
+                          </button>
+                          <button
+                            className="rounded-full border border-gray-200 px-3 py-1.5 text-xs text-gray-600"
+                            type="button"
+                            onClick={cancelEditingRule}
+                          >
+                            取消
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2 text-xs">
+                              <span
+                                className="rounded-full px-2.5 py-1 font-medium"
+                                style={{
+                                  backgroundColor: `${rule.tag.color ?? "#2563eb"}20`,
+                                  color: rule.tag.color ?? "#2563eb",
+                                }}
+                              >
+                                #{rule.tag.name}
+                              </span>
+                              <span className="rounded-full bg-white px-2.5 py-1 text-gray-600">
+                                {MATCH_TYPE_OPTIONS.find((option) => option.value === rule.matchType)?.label}
+                              </span>
+                              <span className="rounded-full bg-white px-2.5 py-1 text-gray-500">
+                                P{rule.priority}
+                              </span>
+                            </div>
+                            <p className="mt-2 break-words text-xs leading-5 text-gray-500">
+                              {requiresMatchValue(rule.matchType)
+                                ? rule.matchValue
+                                : getRuleHelperText(rule.matchType)}
+                            </p>
+                          </div>
+                          {supportsAutoTagRules ? (
+                            <div className="flex shrink-0 items-center gap-1">
+                              <button
+                                className="rounded-full p-2 text-gray-500 transition hover:bg-white hover:text-blue-600"
+                                type="button"
+                                onClick={() => startEditingRule(rule)}
+                                aria-label="编辑规则"
+                              >
+                                <Pencil size={14} />
+                              </button>
+                              <button
+                                className="rounded-full p-2 text-gray-500 transition hover:bg-white hover:text-red-500 disabled:opacity-50"
+                                type="button"
+                                onClick={() => {
+                                  void deleteAutoTagRule(rule);
+                                }}
+                                disabled={isSavingRule}
+                                aria-label="删除规则"
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {supportsAutoTagRules && supportsTags ? (
+              <div className="mt-4 space-y-2 rounded-2xl border border-dashed border-gray-200 bg-white/80 p-3">
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <select
+                    className="rounded-2xl border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
+                    value={newRuleTagId}
+                    onChange={(e) => setNewRuleTagId(e.target.value)}
+                  >
+                    {allTags.map((tag) => (
+                      <option key={tag.id} value={tag.id}>
+                        #{tag.name}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="rounded-2xl border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
+                    value={newRuleMatchType}
+                    onChange={(e) => {
+                      const nextMatchType = e.target.value as AutoTagMatchType;
+                      setNewRuleMatchType(nextMatchType);
+
+                      if (!requiresMatchValue(nextMatchType)) {
+                        setNewRuleMatchValue("");
+                      }
+                    }}
+                  >
+                    {MATCH_TYPE_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_90px]">
+                  <input
+                    className="rounded-2xl border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
+                    placeholder={getRuleInputPlaceholder(newRuleMatchType)}
+                    value={newRuleMatchValue}
+                    onChange={(e) => setNewRuleMatchValue(e.target.value)}
+                    disabled={!requiresMatchValue(newRuleMatchType)}
+                  />
+                  <input
+                    className="rounded-2xl border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-700 outline-none focus:border-blue-400"
+                    placeholder="优先级"
+                    value={newRulePriority}
+                    onChange={(e) => setNewRulePriority(e.target.value)}
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-[11px] leading-5 text-gray-400">
+                    {getRuleHelperText(newRuleMatchType)}
+                  </p>
+                  <button
+                    className="inline-flex items-center gap-2 rounded-full bg-gray-900 px-4 py-2 text-xs text-white disabled:opacity-50"
+                    type="button"
+                    onClick={() => {
+                      void createAutoTagRule();
+                    }}
+                    disabled={isSavingRule || !newRuleTagId}
+                  >
+                    <Plus size={14} />
+                    新建规则
+                  </button>
+                </div>
+              </div>
+            ) : null}
+          </section>
         </aside>
 
         <section className="min-w-0 rounded-[2rem] border border-white/70 bg-white/70 shadow-[0_15px_50px_rgba(15,23,42,0.06)] backdrop-blur-xl">
           <div className="border-b border-gray-100 px-5 py-4 sm:px-6">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
               <p className="text-sm text-gray-500">
+                {activeView === "all"
+                  ? "主列表"
+                  : activeView === "starred"
+                    ? "收藏"
+                    : "归档"}
+                {" · "}
                 {activeFolderId === "all"
                   ? "全部消息"
                   : `当前文件夹：${folders.find((folder) => folder.id === activeFolderId)?.name ?? "未命名"}`}
@@ -1207,25 +1903,65 @@ export default function Home() {
                   : ""}
               </p>
 
-              <label className="flex items-center gap-2 rounded-full border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-500">
-                <Search size={16} />
-                <input
-                  className="min-w-0 bg-transparent text-sm text-gray-700 outline-none placeholder:text-gray-400 sm:w-56"
-                  placeholder={supportsServerSearch ? "搜索消息内容" : "搜索消息内容（本地匹配）"}
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                />
-                {searchQuery ? (
+              <div className="flex flex-col gap-3 sm:items-end">
+                <div className="flex flex-wrap gap-2">
                   <button
-                    className="rounded-full p-1 text-gray-400 transition hover:bg-gray-200 hover:text-gray-600"
+                    className={`rounded-full px-4 py-2 text-xs transition ${
+                      activeView === "all"
+                        ? "bg-gray-900 text-white"
+                        : "border border-gray-200 bg-white text-gray-600 hover:border-gray-300"
+                    }`}
                     type="button"
-                    onClick={() => setSearchQuery("")}
-                    aria-label="清空搜索"
+                    onClick={() => setActiveView("all")}
                   >
-                    <X size={14} />
+                    全部
                   </button>
-                ) : null}
-              </label>
+                  <button
+                    className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-xs transition ${
+                      activeView === "starred"
+                        ? "bg-amber-500 text-white"
+                        : "border border-amber-200 bg-white text-amber-600 hover:border-amber-300"
+                    }`}
+                    type="button"
+                    onClick={() => setActiveView("starred")}
+                  >
+                    <Star size={14} className={activeView === "starred" ? "fill-current" : ""} />
+                    收藏
+                  </button>
+                  <button
+                    className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-xs transition ${
+                      activeView === "archived"
+                        ? "bg-slate-700 text-white"
+                        : "border border-slate-200 bg-white text-slate-600 hover:border-slate-300"
+                    }`}
+                    type="button"
+                    onClick={() => setActiveView("archived")}
+                  >
+                    <Archive size={14} />
+                    归档
+                  </button>
+                </div>
+
+                <label className="flex items-center gap-2 rounded-full border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-500">
+                  <Search size={16} />
+                  <input
+                    className="min-w-0 bg-transparent text-sm text-gray-700 outline-none placeholder:text-gray-400 sm:w-56"
+                    placeholder={supportsServerSearch ? "搜索消息内容" : "搜索消息内容（本地匹配）"}
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                  />
+                  {searchQuery ? (
+                    <button
+                      className="rounded-full p-1 text-gray-400 transition hover:bg-gray-200 hover:text-gray-600"
+                      type="button"
+                      onClick={() => setSearchQuery("")}
+                      aria-label="清空搜索"
+                    >
+                      <X size={14} />
+                    </button>
+                  ) : null}
+                </label>
+              </div>
             </div>
           </div>
 
@@ -1294,6 +2030,36 @@ export default function Home() {
                               </p>
                               <div className="flex flex-wrap gap-2">
                                 <button
+                                  className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${
+                                    note.isStarred
+                                      ? "border-amber-200 bg-amber-50 text-amber-600"
+                                      : "border-gray-200 text-gray-600 hover:border-amber-200 hover:text-amber-600"
+                                  }`}
+                                  type="button"
+                                  onClick={() => {
+                                    void toggleNoteStar(note);
+                                  }}
+                                  disabled={noteActionId === note.id}
+                                >
+                                  <Star size={14} className={note.isStarred ? "fill-current" : ""} />
+                                  {note.isStarred ? "取消收藏" : "加入收藏"}
+                                </button>
+                                <button
+                                  className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${
+                                    note.isArchived
+                                      ? "border-slate-200 bg-slate-100 text-slate-600"
+                                      : "border-gray-200 text-gray-600 hover:border-slate-300 hover:text-slate-700"
+                                  }`}
+                                  type="button"
+                                  onClick={() => {
+                                    void toggleNoteArchived(note);
+                                  }}
+                                  disabled={noteActionId === note.id}
+                                >
+                                  <Archive size={14} />
+                                  {note.isArchived ? "取消归档" : "归档"}
+                                </button>
+                                <button
                                   className="inline-flex items-center gap-2 rounded-full border border-gray-200 px-3 py-1.5 text-xs text-gray-600 transition hover:border-blue-300 hover:text-blue-600"
                                   type="button"
                                   onClick={() => startEditingNote(note)}
@@ -1318,8 +2084,22 @@ export default function Home() {
                             </div>
                           )}
 
-                          {(note.folderName || note.tags.length > 0) && (
+                          {(note.folderName || note.tags.length > 0 || note.isStarred || note.isArchived) && (
                             <div className="mt-3 flex flex-wrap items-center gap-2">
+                              {note.isStarred ? (
+                                <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-1 text-xs text-amber-600">
+                                  <Star size={12} className="fill-current" />
+                                  收藏
+                                </span>
+                              ) : null}
+
+                              {note.isArchived ? (
+                                <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1 text-xs text-slate-600">
+                                  <Archive size={12} />
+                                  已归档
+                                </span>
+                              ) : null}
+
                               {note.folderName ? (
                                 <span className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2.5 py-1 text-xs text-gray-600">
                                   <Folder size={12} />
@@ -1468,7 +2248,9 @@ export default function Home() {
                     }}
                   />
                   <p className="mt-2 px-1 text-xs text-gray-400">
-                    现在会自动识别部分内容并打标签，比如链接、待办、代码、清单。
+                    {supportsAutoTagRules
+                      ? "会按你在左侧配置的规则自动打标签。"
+                      : `现在会自动识别部分内容并打标签，比如${FALLBACK_AUTO_TAG_NAMES.join("、")}。`}
                   </p>
                 </div>
 

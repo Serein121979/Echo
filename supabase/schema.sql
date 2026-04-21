@@ -19,6 +19,19 @@ create table if not exists public.tags (
 create unique index if not exists tags_name_lower_idx
   on public.tags (lower(name));
 
+create table if not exists public.auto_tag_rules (
+  id uuid primary key default gen_random_uuid(),
+  match_type text not null,
+  match_value text,
+  tag_id uuid not null references public.tags(id) on delete cascade,
+  priority integer not null default 100,
+  created_at timestamptz not null default timezone('utc', now()),
+  updated_at timestamptz not null default timezone('utc', now()),
+  constraint auto_tag_rules_match_type_check check (
+    match_type in ('contains', 'regex', 'url', 'phone', 'min_length', 'line_breaks')
+  )
+);
+
 create table if not exists public.notes (
   id uuid primary key default gen_random_uuid(),
   content text not null,
@@ -38,11 +51,29 @@ alter table public.notes
   add column if not exists fts tsvector
   generated always as (to_tsvector('simple', coalesce(content, ''))) stored;
 
+alter table public.notes
+  add column if not exists is_starred boolean not null default false;
+
+alter table public.notes
+  add column if not exists is_archived boolean not null default false;
+
 create index if not exists notes_deleted_at_idx
   on public.notes (deleted_at);
 
+create index if not exists notes_is_starred_idx
+  on public.notes (is_starred);
+
+create index if not exists notes_is_archived_idx
+  on public.notes (is_archived);
+
 create index if not exists notes_fts_idx
   on public.notes using gin (fts);
+
+create index if not exists auto_tag_rules_tag_id_idx
+  on public.auto_tag_rules (tag_id);
+
+create index if not exists auto_tag_rules_priority_idx
+  on public.auto_tag_rules (priority desc, created_at asc);
 
 create table if not exists public.note_tags (
   note_id uuid not null references public.notes(id) on delete cascade,
@@ -68,16 +99,64 @@ before update on public.notes
 for each row
 execute function public.set_updated_at();
 
+drop trigger if exists set_auto_tag_rules_updated_at on public.auto_tag_rules;
+
+create trigger set_auto_tag_rules_updated_at
+before update on public.auto_tag_rules
+for each row
+execute function public.set_updated_at();
+
 insert into public.folders (name)
 select '收件箱'
 where not exists (
   select 1 from public.folders where lower(name) = lower('收件箱')
 );
 
+insert into public.tags (name, color)
+select seed.name, seed.color
+from (
+  values
+    ('待办', '#f97316'),
+    ('链接', '#2563eb'),
+    ('代码', '#7c3aed'),
+    ('清单', '#16a34a'),
+    ('长文', '#db2777'),
+    ('电话', '#0f766e')
+) as seed(name, color)
+where not exists (
+  select 1 from public.tags where lower(tags.name) = lower(seed.name)
+);
+
+insert into public.auto_tag_rules (match_type, match_value, tag_id, priority)
+select seed.match_type, seed.match_value, tags.id, seed.priority
+from (
+  values
+    ('链接', 'url', null, 100),
+    ('待办', 'contains', 'todo', 100),
+    ('待办', 'contains', '待办', 90),
+    ('待办', 'contains', '待处理', 80),
+    ('待办', 'contains', 'follow up', 70),
+    ('待办', 'contains', 'follow-up', 60),
+    ('代码', 'regex', '```|function |const |let |var |=>|class |import |export ', 100),
+    ('清单', 'regex', '^[-*]\\s', 100),
+    ('清单', 'line_breaks', '2', 90),
+    ('长文', 'min_length', '120', 100),
+    ('电话', 'phone', null, 100)
+) as seed(tag_name, match_type, match_value, priority)
+join public.tags on lower(tags.name) = lower(seed.tag_name)
+where not exists (
+  select 1
+  from public.auto_tag_rules rules
+  where rules.tag_id = tags.id
+    and rules.match_type = seed.match_type
+    and coalesce(rules.match_value, '') = coalesce(seed.match_value, '')
+);
+
 alter table public.notes enable row level security;
 alter table public.folders enable row level security;
 alter table public.tags enable row level security;
 alter table public.note_tags enable row level security;
+alter table public.auto_tag_rules enable row level security;
 
 do $$
 begin
@@ -128,6 +207,18 @@ begin
     using (true)
     with check (true);
   end if;
+
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'auto_tag_rules' and policyname = 'Public access to auto_tag_rules'
+  ) then
+    create policy "Public access to auto_tag_rules"
+    on public.auto_tag_rules
+    for all
+    to anon, authenticated
+    using (true)
+    with check (true);
+  end if;
 end
 $$;
 
@@ -167,6 +258,15 @@ begin
     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'note_tags'
   ) then
     execute 'alter publication supabase_realtime add table public.note_tags';
+  end if;
+
+  if exists (
+    select 1 from pg_publication where pubname = 'supabase_realtime'
+  ) and not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'auto_tag_rules'
+  ) then
+    execute 'alter publication supabase_realtime add table public.auto_tag_rules';
   end if;
 end
 $$;

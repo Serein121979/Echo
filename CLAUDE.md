@@ -23,9 +23,10 @@ Echo 是一个**面向个人的跨设备消息同步与整理工具**，灵感�
 - 跨设备实时同步（Supabase Realtime，轮询兜底）
 - 文件夹管理（创建 / 切换 / 删除，默认收件箱）
 - 标签系统（创建 / 筛选 / 删除，一条消息可多标签）
-- 自动标签（规则型，发送即分类）
+- 自动标签（数据库规则驱动，支持 UI 增删改）
 - 消息编辑（编辑后自动刷新自动标签）
 - 消息列表（自动滚动到底部，体验接近 IM）
+- 收藏 / 归档（支持主列表、收藏、归档三种视图，字段为 `is_starred` / `is_archived`）
 
 ---
 
@@ -68,8 +69,8 @@ auto_tag_rules → 自动标签规则（match_type, match_value, tag_id, priorit
 - [x] 全文搜索（PostgreSQL FTS，`tsvector` + `gin` 索引）（已实现）
 
 ### 🟠 P1 — 差异化核心体验
-- [ ] 收藏 / 归档（`is_starred` / `is_archived` 字段）
-- [ ] 自动标签规则可配置（UI 可增删改规则）
+- [x] 收藏 / 归档（`is_starred` / `is_archived` 字段）
+- [x] 自动标签规则可配置（UI 可增删改规则）
 
 ### 🟡 P2 — 体验打磨
 - [ ] PWA 安装体验（`next-pwa` 或 `@ducanh2912/next-pwa`）
@@ -94,7 +95,8 @@ auto_tag_rules → 自动标签规则（match_type, match_value, tag_id, priorit
 
 ## 当前已知问题 / 技术债
 
-- 自动标签规则目前硬编码在前端，待迁移至数据库驱动
+- 新环境需执行最新 `supabase/schema.sql` 才能启用 `auto_tag_rules` 表与默认规则
+- 当前开发环境如果要通过局域网 IP 访问，需要确认 `next.config.ts` 的 `allowedDevOrigins` 与本机 IP 一致
 - 移动端键盘弹起时输入框可能被遮挡（`vh` 单位问题）
 - 搜索目前已接入数据库全文搜索，旧表结构下会降级为前端内容匹配
 
@@ -110,4 +112,4 @@ auto_tag_rules → 自动标签规则（match_type, match_value, tag_id, priorit
 
 ---
 
-*最后更新：P0 删除消息与全文搜索已完成*
+*最后更新：P1 收藏 / 归档与自动标签规则配置已完成*
