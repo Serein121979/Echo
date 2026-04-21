@@ -37,11 +37,28 @@ Echo 是一个**面向个人的跨设备消息同步与整理工具**，灵感�
 
 | 层级 | 技术 | 说明 |
 |------|------|------|
-| 框架 | Next.js 16 | App Router |
-| UI | React 19 + Tailwind CSS 4 | 不引入 UI 组件库 |
-| 语言 | TypeScript | 严格类型 |
-| 后端 / 实时 | Supabase | Database + Realtime |
-| 部署 | Vercel | 默认目标平台 |
+| 框架 | Next.js 16 | 使用 App Router，当前页面主要是 Client Component 驱动的交互式单页体验 |
+| 运行时 | React 19 | 使用现代 Hooks 和客户端状态管理，不引入额外状态库 |
+| 样式 | Tailwind CSS 4 | 仅用原子类和少量全局样式，界面保持黑白极简风 |
+| 语言 | TypeScript | 严格类型，前端和数据库返回值都尽量显式建模 |
+| 后端 / 数据库 | Supabase Postgres | `notes` / `folders` / `tags` / `note_tags` / `auto_tag_rules` 为核心数据表 |
+| 实时同步 | Supabase Realtime | 监听 `notes`、`folders`、`tags`、`note_tags`、`auto_tag_rules` 的变更 |
+| 文件存储 | Supabase Storage | 附件统一放在 `echo-files` 存储桶，前端使用公开下载链接 |
+| 部署 | Vercel | 默认目标平台，兼容电脑端和手机端访问 |
+| 图标 / PWA | Next.js 原生 metadata route | 使用 `manifest.ts` 和站点图标提供基础安装体验 |
+
+### 当前前端依赖
+
+- `date-fns`：消息时间格式化
+- `lucide-react`：图标
+- `@supabase/supabase-js`：数据库、实时和存储访问
+
+### 当前开发约束
+
+- 不引入额外 UI 组件库
+- 不引入额外状态管理库
+- 不引入 ORM 或数据库抽象层
+- 不引入需要常驻服务的依赖
 
 **不要引入以下内容（除非明确被要求）：**
 - 额外的状态管理库（Redux、Zustand 等）
