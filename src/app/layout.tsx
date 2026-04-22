@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { PwaServiceWorker } from "@/components/pwa/PwaServiceWorker";
 
 export const metadata: Metadata = {
   title: "Echo - 极简跨设备消息箱",
@@ -22,7 +23,10 @@ export default function RootLayout({
       lang="zh-CN"
       className="h-full antialiased"
     >
-      <body className="min-h-full flex flex-col bg-background text-foreground">{children}</body>
+      <body className="min-h-full flex flex-col bg-background text-foreground">
+        {children}
+        <PwaServiceWorker />
+      </body>
     </html>
   );
 }

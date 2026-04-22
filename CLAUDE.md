@@ -1,5 +1,3 @@
-
-
 # Echo — AI 开发上下文文档
 
 > 本文件用于向 AI 编程助手说明项目背景、技术约束和开发原则。
@@ -30,6 +28,7 @@ Echo 是一个**面向个人的跨设备消息同步与整理工具**，灵感�
 - 收藏 / 归档（支持主列表、收藏、归档三种视图，字段为 `is_starred` / `is_archived`）
 - 黑白极简界面（侧边栏默认收起，点击后抽屉展开）
 - PWA 基础安装体验（manifest + 安装提示）
+- PWA Share Target（系统分享直接写入收件箱）
 
 ---
 
@@ -45,7 +44,7 @@ Echo 是一个**面向个人的跨设备消息同步与整理工具**，灵感�
 | 实时同步 | Supabase Realtime | 监听 `notes`、`folders`、`tags`、`note_tags`、`auto_tag_rules` 的变更 |
 | 文件存储 | Supabase Storage | 附件统一放在 `echo-files` 存储桶，前端使用公开下载链接 |
 | 部署 | Vercel | 默认目标平台，兼容电脑端和手机端访问 |
-| 图标 / PWA | Next.js 原生 metadata route | 使用 `manifest.ts` 和站点图标提供基础安装体验 |
+| 图标 / PWA | Next.js 原生 metadata route | 使用 `manifest.ts`、`/share` 路由和 `sw.js` 提供安装与分享体验 |
 
 ### 当前前端依赖
 
@@ -86,8 +85,8 @@ storage bucket echo-files → 附件存储
 ## Roadmap（按优先级排列）
 
 ### 🔴 P0 — 补全基础功能
-- [x] 删除消息（软删除）（已实现）
-- [x] 全文搜索（PostgreSQL FTS，`tsvector` + `gin` 索引）（已实现）
+- [x] 删除消息（软删除）
+- [x] 全文搜索（PostgreSQL FTS，`tsvector` + `gin` 索引）
 
 ### 🟠 P1 — 差异化核心体验
 - [x] 收藏 / 归档（`is_starred` / `is_archived` 字段）
@@ -95,11 +94,81 @@ storage bucket echo-files → 附件存储
 
 ### 🟡 P2 — 体验打磨
 - [x] PWA 安装体验（基础版 manifest + 安装提示）
+- [x] PWA Share Target（系统分享直达收件箱）
 - [x] 移动端体验优化（抽屉侧边栏、黑白极简 UI、`dvh` 单位）
 
 ### 🟢 P3 — AI 增强（基础稳定后再做）
 - [ ] AI 自动分类（Supabase Edge Function → AI API → 写回 note）
 - [ ] AI 自动摘要
+
+---
+
+## 专项：PWA Share Target
+
+### 目标
+
+让手机上任何 App（相册、浏览器、备忘录等）点击"分享"时，可以直接选择 Echo 作为目标，内容自动进入收件箱。效果等同于分享给微信，无需打开浏览器手动操作。
+
+**支持的分享类型：**
+- 纯文字 / URL
+- 图片（单张）
+- 任意文件
+
+### 当前实现
+
+这部分已经落地，相关文件如下：
+
+- [`src/app/manifest.ts`](/Users/Zhuanz/echo-app/src/app/manifest.ts)
+- [`src/app/share/route.ts`](/Users/Zhuanz/echo-app/src/app/share/route.ts)
+- [`src/app/layout.tsx`](/Users/Zhuanz/echo-app/src/app/layout.tsx)
+- [`src/components/pwa/PwaServiceWorker.tsx`](/Users/Zhuanz/echo-app/src/components/pwa/PwaServiceWorker.tsx)
+- [`public/sw.js`](/Users/Zhuanz/echo-app/public/sw.js)
+
+### 行为说明
+
+```
+POST /share
+  ↓
+读取 FormData（text / url / title / file）
+  ↓
+有文件 → 上传到 Supabase Storage echo-files 桶
+  ↓
+写入 notes 表（`content = text + url`，附件字段按需填写）
+  ↓
+303 重定向回 `/`（主界面）
+```
+
+**处理逻辑细节：**
+- `text` 和 `url` 合并写入 `content`，格式为 `${text}\n${url}`（去掉空值）
+- `title` 作为辅助信息，可附加在 content 末尾或忽略
+- 有文件时：上传到 `echo-files`，写入 `file_path` / `file_url` / `file_name` / `file_type` / `file_size`
+- 写入的 note 默认落在收件箱（`folder_id = null` 或默认收件箱 ID）
+- 写入成功后 `redirect("/")` 跳回主界面
+
+### 文件变更清单
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `src/app/manifest.ts` | 修改 | 增加 `share_target` 字段 |
+| `src/app/share/route.ts` | 新增 | 处理 POST /share 请求 |
+| `public/sw.js` | 新增 | 最简 Service Worker |
+| `src/app/layout.tsx` | 修改 | 挂载 Service Worker 注册组件 |
+| `src/components/pwa/PwaServiceWorker.tsx` | 新增 | 客户端注册 `/sw.js` |
+
+### 注意事项
+
+- **仅 HTTPS 生效**：Share Target 要求 PWA 运行在 HTTPS 下，本地 `localhost` 也支持，但局域网 IP 不支持（除非配置证书）。
+- **需先安装到主屏幕**：Share Target 只对已安装的 PWA 有效，用浏览器直接访问时不会出现在分享菜单。
+- **iOS Safari 的限制**：iOS 16.4+ 支持 PWA Share Target，但仅支持文字和 URL，文件分享支持有限，需测试。
+- **不要在 /share 路由中引入客户端组件**：这个路由纯粹是服务端 Route Handler，处理完直接 redirect，不渲染任何 UI。
+- **文件大小限制**：Supabase Storage 默认单文件上传限制为 50MB，与现有附件逻辑保持一致。
+
+### 测试方法
+
+1. 本地启动后先确认 `manifest.webmanifest` 里包含 `share_target`
+2. 电脑或手机浏览器访问站点，确认可以安装到桌面 / 主屏幕
+3. 安装后从手机相册、浏览器或备忘录执行“分享”
+4. 选择 Echo，确认消息写入收件箱并在主界面显示
 
 ---
 
@@ -119,17 +188,17 @@ storage bucket echo-files → 附件存储
 - 新环境需执行最新 `supabase/schema.sql` 才能启用 `auto_tag_rules`、附件字段和 `echo-files` 存储桶
 - 当前开发环境如果要通过局域网 IP 访问，需要确认 `next.config.ts` 的 `allowedDevOrigins` 与本机 IP 一致
 - 搜索目前已接入数据库全文搜索，旧表结构下会降级为前端内容匹配
+- PWA Share Target 仅在 HTTPS + 已安装状态下生效，本地开发时需注意
 
 ---
 
 ## 不在范围内的功能（除非作者明确要求）
 
 - 多用户 / 账号系统
-- 文件上传（图片、附件等二进制内容）
 - 消息分享给他人
 - 第三方登录
 - 消息加密
 
 ---
 
-*最后更新：P2 黑白极简移动端体验、PWA 基础安装与附件发送下载已完成*
+*最后更新：PWA Share Target 已实现并与 README 保持同步*
