@@ -1,9 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, type UIEvent } from "react";
-import { getSupabaseClient, supabaseConfigError } from "@/utils/supabase/client";
+import { getSupabaseClient } from "@/utils/supabase/client";
 import { EchoComposer } from "@/components/echo/EchoComposer";
-import { EchoInstallBanner } from "@/components/echo/EchoInstallBanner";
 import { EchoMainPanel } from "@/components/echo/EchoMainPanel";
 import { EchoSidebar } from "@/components/echo/EchoSidebar";
 import { createEchoActions } from "@/components/echo/echoActions";
@@ -17,7 +16,6 @@ import type {
 } from "@/components/echo/types";
 import {
   DEFAULT_AUTO_TAG_RULES,
-  FALLBACK_AUTO_TAG_NAMES,
   FALLBACK_POLL_MS,
   fetchAutoTagRules,
   fetchFolders,
@@ -42,7 +40,6 @@ export function EchoApp() {
   const [autoTagRules, setAutoTagRules] = useState<AutoTagRule[]>([]);
   const [activeFolderId, setActiveFolderId] = useState("all");
   const [activeTagId, setActiveTagId] = useState("all");
-  const [activeView, setActiveView] = useState<"all" | "starred" | "archived">("all");
   const [selectedFolderId, setSelectedFolderId] = useState("");
   const [newFolderName, setNewFolderName] = useState("");
   const [newTagName, setNewTagName] = useState("");
@@ -69,16 +66,14 @@ export function EchoApp() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [syncMode, setSyncMode] = useState("轮询兜底中");
   const [supportsFolders, setSupportsFolders] = useState(false);
   const [supportsTags, setSupportsTags] = useState(false);
   const [supportsAutoTagRules, setSupportsAutoTagRules] = useState(false);
   const [supportsSoftDelete, setSupportsSoftDelete] = useState(false);
-  const [supportsServerSearch, setSupportsServerSearch] = useState(false);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [openActionMenuNoteId, setOpenActionMenuNoteId] = useState<string | null>(null);
+  const [scrollToBottomToken, setScrollToBottomToken] = useState(0);
   const [installPromptEvent, setInstallPromptEvent] = useState<BeforeInstallPromptEvent | null>(
     null,
   );
@@ -95,8 +90,31 @@ export function EchoApp() {
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const prevNoteCountRef = useRef(0);
-  const shouldScrollToBottomRef = useRef(true);
+  const prevScrollToBottomTokenRef = useRef(0);
+  const isNearBottomRef = useRef(true);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const visualViewport = window.visualViewport;
+
+    const updateAppHeight = () => {
+      const height = visualViewport?.height ?? window.innerHeight;
+      root.style.setProperty("--app-height", `${height}px`);
+    };
+
+    updateAppHeight();
+    visualViewport?.addEventListener("resize", updateAppHeight);
+    visualViewport?.addEventListener("scroll", updateAppHeight);
+    window.addEventListener("resize", updateAppHeight);
+
+    return () => {
+      visualViewport?.removeEventListener("resize", updateAppHeight);
+      visualViewport?.removeEventListener("scroll", updateAppHeight);
+      window.removeEventListener("resize", updateAppHeight);
+      root.style.removeProperty("--app-height");
+    };
+  }, []);
 
   const effectiveAutoTagRules = useMemo<AutoTagRule[]>(
     () =>
@@ -130,6 +148,14 @@ export function EchoApp() {
     setIsSidebarOpen(false);
   }, []);
 
+  const toggleActionMenu = useCallback((noteId: string) => {
+    setOpenActionMenuNoteId((current) => (current === noteId ? null : noteId));
+  }, []);
+
+  const closeActionMenu = useCallback(() => {
+    setOpenActionMenuNoteId(null);
+  }, []);
+
   const removePendingFile = useCallback(() => {
     setPendingFile(null);
   }, []);
@@ -137,16 +163,12 @@ export function EchoApp() {
   const handleMainPanelScroll = useCallback((e: UIEvent<HTMLDivElement>) => {
     const target = e.currentTarget;
     const distanceToBottom = target.scrollHeight - target.scrollTop - target.clientHeight;
-    shouldScrollToBottomRef.current = distanceToBottom < 80;
+    isNearBottomRef.current = distanceToBottom < 80;
   }, []);
 
-  useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      setDebouncedSearchQuery(searchQuery.trim());
-    }, 250);
-
-    return () => clearTimeout(timeoutId);
-  }, [searchQuery]);
+  const requestScrollToBottom = useCallback(() => {
+    setScrollToBottomToken((current) => current + 1);
+  }, []);
 
   useEffect(() => {
     const handleBeforeInstallPrompt = (event: Event) => {
@@ -177,7 +199,7 @@ export function EchoApp() {
           }, 8000);
         });
 
-        const request = Promise.all([fetchNotes(debouncedSearchQuery), fetchFolders(), fetchNoteTags(), fetchTags(), fetchAutoTagRules()]);
+        const request = Promise.all([fetchNotes(""), fetchFolders(), fetchNoteTags(), fetchTags(), fetchAutoTagRules()]);
         const [notesResult, foldersResult, noteTagsResult, tagsResult, autoTagRulesResult] = await Promise.race([request, timeout]);
 
         if (notesResult.error) throw notesResult.error;
@@ -236,7 +258,6 @@ export function EchoApp() {
         setSupportsTags(noteTagsResult.enabled && tagsResult.enabled);
         setSupportsAutoTagRules(autoTagRulesResult.enabled);
         setSupportsSoftDelete(notesResult.supportsSoftDelete);
-        setSupportsServerSearch(notesResult.supportsServerSearch);
         setNotes(nextNotes);
 
         setSelectedFolderId((current) => {
@@ -279,14 +300,13 @@ export function EchoApp() {
         setSupportsTags(false);
         setSupportsAutoTagRules(false);
         setSupportsSoftDelete(false);
-        setSupportsServerSearch(false);
         setError(getErrorMessage(error, "加载失败，请稍后重试"));
       } finally {
         if (timeoutId) clearTimeout(timeoutId);
         setIsLoading(false);
       }
     },
-    [debouncedSearchQuery],
+    [],
   );
 
   useEffect(() => {
@@ -317,21 +337,7 @@ export function EchoApp() {
       .on("postgres_changes", { event: "*", schema: "public", table: "auto_tag_rules" }, () => {
         void fetchAppData();
       })
-      .subscribe((status) => {
-        if (status === "SUBSCRIBED") {
-          setSyncMode("实时同步已连接");
-          return;
-        }
-
-        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          setSyncMode("实时同步异常，使用轮询兜底");
-          return;
-        }
-
-        if (status === "CLOSED") {
-          setSyncMode("连接已关闭，等待重连");
-        }
-      });
+      .subscribe(() => {});
 
     return () => {
       void supabase.removeChannel(channel);
@@ -348,28 +354,24 @@ export function EchoApp() {
 
   useEffect(() => {
     const hasNewNote = notes.length > prevNoteCountRef.current;
-    if (hasNewNote || shouldScrollToBottomRef.current) {
+    const shouldForceScroll = scrollToBottomToken !== prevScrollToBottomTokenRef.current;
+
+    if (shouldForceScroll || (hasNewNote && isNearBottomRef.current)) {
       bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
     }
+
+    prevScrollToBottomTokenRef.current = scrollToBottomToken;
     prevNoteCountRef.current = notes.length;
-  }, [notes]);
+  }, [notes, scrollToBottomToken]);
 
   const filteredNotes = useMemo(() => {
-    const normalizedSearch = debouncedSearchQuery.toLowerCase();
-
     return notes.filter((note) => {
-      const matchesView =
-        activeView === "archived"
-          ? note.isArchived
-          : activeView === "starred"
-            ? note.isStarred && !note.isArchived
-            : !note.isArchived;
+      const matchesView = !note.isArchived;
       const matchesFolder = activeFolderId === "all" || note.folderId === activeFolderId;
       const matchesTag = activeTagId === "all" || note.tags.some((tag) => tag.id === activeTagId);
-      const matchesSearch = !normalizedSearch || supportsServerSearch || note.content.toLowerCase().includes(normalizedSearch);
-      return matchesView && matchesFolder && matchesTag && matchesSearch;
+      return matchesView && matchesFolder && matchesTag;
     });
-  }, [activeFolderId, activeTagId, activeView, debouncedSearchQuery, notes, supportsServerSearch]);
+  }, [activeFolderId, activeTagId, notes]);
 
   const actions = createEchoActions({
     notes,
@@ -433,7 +435,7 @@ export function EchoApp() {
     setNotice,
     setIsSidebarOpen,
     setInstallPromptEvent,
-    setSyncMode,
+    requestScrollToBottom,
     refreshAppData: fetchAppData,
   });
 
@@ -466,36 +468,8 @@ export function EchoApp() {
   } = actions;
 
   return (
-    <div className="min-h-[100dvh] bg-[#f5f5f5] text-neutral-950">
-      <header className="sticky top-0 z-30 border-b border-neutral-200 bg-white/92 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-4 sm:px-6">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight text-neutral-950">Echo</h1>
-            <p className="mt-1 text-sm text-neutral-500">黑白极简的跨设备自发消息箱</p>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              className="rounded-full border border-neutral-200 bg-white px-4 py-2 text-sm text-neutral-700"
-              type="button"
-              onClick={() => setIsSidebarOpen(true)}
-            >
-              打开侧边栏
-            </button>
-          </div>
-        </div>
-      </header>
-
-      <div className="mx-auto flex max-w-6xl flex-col gap-4 px-4 py-4 sm:px-6">
-        <p className="px-1 text-xs text-neutral-400">
-          {supabaseConfigError ? "Supabase 未配置" : syncMode}
-          {" · "}
-          {supportsAutoTagRules
-            ? "文件夹 / 标签 / 自动规则已启用"
-            : supportsFolders
-              ? "文件夹 / 标签结构已启用"
-              : "兼容旧表结构"}
-        </p>
-
+    <div className="flex h-[var(--app-height,100dvh)] flex-col overflow-hidden bg-[#f5f5f5] text-neutral-950">
+      <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col gap-4 px-4 py-4 sm:px-6">
         <EchoSidebar
           isOpen={isSidebarOpen}
           error={error}
@@ -508,6 +482,9 @@ export function EchoApp() {
           isCreatingFolder={isCreatingFolder}
           isCreatingTag={isCreatingTag}
           isSavingRule={isSavingRule}
+          installPromptEvent={installPromptEvent}
+          showIosInstallHint={showIosInstallHint}
+          onInstall={installApp}
           activeFolderId={activeFolderId}
           activeTagId={activeTagId}
           newFolderName={newFolderName}
@@ -551,34 +528,8 @@ export function EchoApp() {
           onEditRuleDraftChange={handleEditRuleDraftChange}
         />
 
-        <EchoInstallBanner
-          installPromptEvent={installPromptEvent}
-          showIosInstallHint={showIosInstallHint}
-          isSidebarOpen={isSidebarOpen}
-          onInstall={installApp}
-        />
-
-        {error ? (
-          <div className="rounded-[1.75rem] border border-neutral-200 bg-white px-5 py-4 text-sm text-neutral-700">
-            {error}
-          </div>
-        ) : null}
-
-        {notice ? (
-          <div className="rounded-[1.75rem] border border-neutral-200 bg-white px-5 py-4 text-sm text-neutral-600">
-            {notice}
-          </div>
-        ) : null}
-
         <EchoMainPanel
-          activeView={activeView}
-          activeFolderId={activeFolderId}
-          activeTagId={activeTagId}
-          searchQuery={searchQuery}
-          debouncedSearchQuery={debouncedSearchQuery}
           folders={folders}
-          allTags={allTags}
-          supportsServerSearch={supportsServerSearch}
           isLoading={isLoading}
           filteredNotes={filteredNotes}
           noteActionId={noteActionId}
@@ -589,8 +540,6 @@ export function EchoApp() {
           supportsFolders={supportsFolders}
           supportsTags={supportsTags}
           supportsSoftDelete={supportsSoftDelete}
-          onSetActiveView={setActiveView}
-          onSetSearchQuery={setSearchQuery}
           onStartEditNote={startEditingNote}
           onCancelEditNote={cancelEditingNote}
           onChangeEditingContent={setEditingContent}
@@ -602,6 +551,9 @@ export function EchoApp() {
           onChangeFolderSelection={handleChangeFolderSelection}
           onChangeTagInput={handleChangeTagInput}
           onAssignTag={assignTagToNote}
+          openActionMenuNoteId={openActionMenuNoteId}
+          onToggleActionMenu={toggleActionMenu}
+          onCloseActionMenu={closeActionMenu}
           bottomRef={bottomRef}
           onScroll={handleMainPanelScroll}
           formatFileSize={formatFileSize}
@@ -615,18 +567,16 @@ export function EchoApp() {
           pendingFile={pendingFile}
           input={input}
           isSending={isSending}
-          supportsAutoTagRules={supportsAutoTagRules}
-          fallbackAutoTagNames={FALLBACK_AUTO_TAG_NAMES}
           onChangeInput={setInput}
           onChangeSelectedFolderId={setSelectedFolderId}
           onOpenFilePicker={openFilePicker}
+          onOpenSidebar={() => setIsSidebarOpen(true)}
           onRemovePendingFile={removePendingFile}
           onSend={handleSend}
           onComposerKeyDown={handleComposerKeyDown}
           onComposerPaste={handleComposerPaste}
           onFileInputChange={handleFileInputChange}
           fileInputRef={fileInputRef}
-          formatFileSize={formatFileSize}
         />
       </div>
     </div>

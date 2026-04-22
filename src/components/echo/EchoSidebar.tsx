@@ -1,5 +1,5 @@
 import { Folder, Pencil, Plus, Star, Tag, Trash2, X } from "lucide-react";
-import type { AutoTagMatchType, AutoTagRule, FolderItem, TagItem } from "./types";
+import type { AutoTagMatchType, AutoTagRule, BeforeInstallPromptEvent, FolderItem, TagItem } from "./types";
 
 type MatchTypeOption = { value: AutoTagMatchType; label: string; hint: string };
 
@@ -15,6 +15,9 @@ type EchoSidebarProps = {
   isCreatingFolder: boolean;
   isCreatingTag: boolean;
   isSavingRule: boolean;
+  installPromptEvent: BeforeInstallPromptEvent | null;
+  showIosInstallHint: boolean;
+  onInstall: () => void;
   activeFolderId: string;
   activeTagId: string;
   newFolderName: string;
@@ -77,6 +80,9 @@ export function EchoSidebar({
   isCreatingFolder,
   isCreatingTag,
   isSavingRule,
+  installPromptEvent,
+  showIosInstallHint,
+  onInstall,
   activeFolderId,
   activeTagId,
   newFolderName,
@@ -136,6 +142,30 @@ export function EchoSidebar({
             <X size={16} />
           </button>
         </div>
+
+        {(!installPromptEvent && !showIosInstallHint) ? null : (
+          <section className="mb-4 rounded-3xl border border-neutral-200 bg-white p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-medium text-neutral-950">安装体验</p>
+                <p className="mt-1 text-sm text-neutral-500">
+                  {installPromptEvent
+                    ? "这个版本已经补了 PWA 基础能力，可以直接安装到桌面或主屏幕。"
+                    : "iPhone 上请点浏览器分享按钮，再选“添加到主屏幕”。"}
+                </p>
+              </div>
+              {installPromptEvent ? (
+                <button
+                  className="rounded-full bg-neutral-950 px-4 py-2 text-sm text-white"
+                  type="button"
+                  onClick={onInstall}
+                >
+                  安装
+                </button>
+              ) : null}
+            </div>
+          </section>
+        )}
 
         {error ? (
           <div className="mb-4 rounded-2xl border border-neutral-300 bg-neutral-100 px-4 py-3 text-sm text-neutral-700">

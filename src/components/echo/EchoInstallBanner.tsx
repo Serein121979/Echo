@@ -18,7 +18,7 @@ export function EchoInstallBanner({
   }
 
   return (
-    <section className="rounded-[1.75rem] border border-neutral-200 bg-white px-5 py-4">
+    <section className="hidden rounded-[1.75rem] border border-neutral-200 bg-white px-5 py-4 sm:block">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <p className="text-sm font-medium text-neutral-950">安装体验</p>

@@ -88,7 +88,7 @@ export type EchoActionsContext = {
   setNotice: (value: string | null) => void;
   setIsSidebarOpen: (value: boolean) => void;
   setInstallPromptEvent: (value: BeforeInstallPromptEvent | null) => void;
-  setSyncMode: (value: string) => void;
+  requestScrollToBottom: () => void;
   refreshAppData: (showLoading?: boolean) => Promise<void>;
 };
 
@@ -670,6 +670,7 @@ export function createEchoActions(ctx: EchoActionsContext) {
         await applyTagsToNote(data.id as string, autoTags);
       }
 
+      ctx.requestScrollToBottom();
       await ctx.refreshAppData();
     } catch (error) {
       console.error("handleSend failed", error);

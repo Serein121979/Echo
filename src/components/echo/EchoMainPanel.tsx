@@ -1,17 +1,9 @@
-import { Archive, Search, Star, X } from "lucide-react";
 import { EchoNoteCard } from "./EchoNoteCard";
-import type { FolderItem, Note, TagItem } from "./types";
+import type { FolderItem, Note } from "./types";
 import type { RefObject, UIEvent } from "react";
 
 type EchoMainPanelProps = {
-  activeView: "all" | "starred" | "archived";
-  activeFolderId: string;
-  activeTagId: string;
-  searchQuery: string;
-  debouncedSearchQuery: string;
   folders: FolderItem[];
-  allTags: TagItem[];
-  supportsServerSearch: boolean;
   isLoading: boolean;
   filteredNotes: Note[];
   noteActionId: string | null;
@@ -22,8 +14,6 @@ type EchoMainPanelProps = {
   supportsFolders: boolean;
   supportsTags: boolean;
   supportsSoftDelete: boolean;
-  onSetActiveView: (view: "all" | "starred" | "archived") => void;
-  onSetSearchQuery: (value: string) => void;
   onStartEditNote: (note: Note) => void;
   onCancelEditNote: () => void;
   onChangeEditingContent: (value: string) => void;
@@ -35,6 +25,9 @@ type EchoMainPanelProps = {
   onChangeFolderSelection: (noteId: string, folderId: string) => void;
   onChangeTagInput: (noteId: string, value: string) => void;
   onAssignTag: (noteId: string) => void;
+  openActionMenuNoteId: string | null;
+  onToggleActionMenu: (noteId: string) => void;
+  onCloseActionMenu: () => void;
   bottomRef: RefObject<HTMLDivElement | null>;
   onScroll: (e: UIEvent<HTMLDivElement>) => void;
   formatFileSize: (size: number | null) => string | null;
@@ -42,14 +35,7 @@ type EchoMainPanelProps = {
 };
 
 export function EchoMainPanel({
-  activeView,
-  activeFolderId,
-  activeTagId,
-  searchQuery,
-  debouncedSearchQuery,
   folders,
-  allTags,
-  supportsServerSearch,
   isLoading,
   filteredNotes,
   noteActionId,
@@ -60,8 +46,6 @@ export function EchoMainPanel({
   supportsFolders,
   supportsTags,
   supportsSoftDelete,
-  onSetActiveView,
-  onSetSearchQuery,
   onStartEditNote,
   onCancelEditNote,
   onChangeEditingContent,
@@ -73,103 +57,18 @@ export function EchoMainPanel({
   onChangeFolderSelection,
   onChangeTagInput,
   onAssignTag,
+  openActionMenuNoteId,
+  onToggleActionMenu,
+  onCloseActionMenu,
   bottomRef,
   onScroll,
   formatFileSize,
   buildDownloadUrl,
 }: EchoMainPanelProps) {
   return (
-    <section className="flex min-h-[calc(100dvh-8.5rem)] flex-col overflow-hidden rounded-[2rem] border border-neutral-200 bg-white">
-      <div className="border-b border-neutral-200 px-4 py-4 sm:px-6">
-        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-          <div className="space-y-2">
-            <p className="text-sm text-neutral-500">
-              {activeView === "all" ? "主列表" : activeView === "starred" ? "收藏" : "归档"}
-              {" · "}
-              {activeFolderId === "all"
-                ? "全部消息"
-                : `当前文件夹：${folders.find((folder) => folder.id === activeFolderId)?.name ?? "未命名"}`}
-              {activeTagId !== "all"
-                ? ` · 标签：#${allTags.find((tag) => tag.id === activeTagId)?.name ?? ""}`
-                : ""}
-              {debouncedSearchQuery ? ` · 搜索：${debouncedSearchQuery}` : ""}
-            </p>
-            <p className="text-xs text-neutral-400">
-              {supportsServerSearch ? "搜索已启用数据库全文检索" : "搜索当前降级为前端内容匹配"}
-            </p>
-          </div>
-
-          <div className="flex flex-col gap-3 sm:items-end">
-            <div className="flex flex-wrap gap-2">
-              <button
-                className={`rounded-full px-4 py-2 text-xs ${
-                  activeView === "all"
-                    ? "bg-neutral-950 text-white"
-                    : "border border-neutral-200 bg-white text-neutral-600"
-                }`}
-                type="button"
-                onClick={() => onSetActiveView("all")}
-              >
-                全部
-              </button>
-              <button
-                className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-xs ${
-                  activeView === "starred"
-                    ? "bg-neutral-950 text-white"
-                    : "border border-neutral-200 bg-white text-neutral-600"
-                }`}
-                type="button"
-                onClick={() => onSetActiveView("starred")}
-              >
-                <Star size={14} className={activeView === "starred" ? "fill-current" : ""} />
-                收藏
-              </button>
-              <button
-                className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-xs ${
-                  activeView === "archived"
-                    ? "bg-neutral-950 text-white"
-                    : "border border-neutral-200 bg-white text-neutral-600"
-                }`}
-                type="button"
-                onClick={() => onSetActiveView("archived")}
-              >
-                <Archive size={14} />
-                归档
-              </button>
-            </div>
-
-            <label className="flex items-center gap-2 rounded-full border border-neutral-200 bg-neutral-100 px-3 py-2 text-sm text-neutral-500">
-              <Search size={16} />
-              <input
-                className="min-w-0 bg-transparent text-sm text-neutral-700 outline-none placeholder:text-neutral-400 sm:w-56"
-                placeholder={supportsServerSearch ? "搜索消息内容" : "搜索消息内容（本地匹配）"}
-                value={searchQuery}
-                onChange={(e) => onSetSearchQuery(e.target.value)}
-              />
-              {searchQuery ? (
-                <button
-                  className="rounded-full p-1 text-neutral-400"
-                  type="button"
-                  onClick={() => onSetSearchQuery("")}
-                  aria-label="清空搜索"
-                >
-                  <X size={14} />
-                </button>
-              ) : null}
-            </label>
-          </div>
-        </div>
-      </div>
-
-      <div className="border-b border-neutral-200 bg-neutral-100 px-4 py-3 text-sm text-neutral-700 sm:px-6">
-        {activeView === "all" ? "主列表" : activeView === "starred" ? "收藏" : "归档"}
-      </div>
-
-      <div
-        className="h-[calc(100dvh-21rem)] min-h-[16rem] overflow-y-auto px-4 py-5 sm:px-6"
-        onScroll={onScroll}
-      >
-        <div className="space-y-5">
+    <section className="flex h-full min-h-0 flex-col overflow-hidden">
+      <div className="min-h-0 flex-1 overflow-y-auto px-0 py-0" onScroll={onScroll}>
+        <div className="space-y-5 px-4 py-5 sm:px-6">
           {isLoading ? (
             <div className="py-16 text-center">
               <div className="mx-auto h-8 w-8 animate-spin rounded-full border-2 border-neutral-300 border-t-neutral-950" />
@@ -204,6 +103,9 @@ export function EchoMainPanel({
                 onChangeFolderSelection={onChangeFolderSelection}
                 onChangeTagInput={onChangeTagInput}
                 onAssignTag={onAssignTag}
+                isActionsOpen={openActionMenuNoteId === note.id}
+                onToggleActions={onToggleActionMenu}
+                onCloseActions={onCloseActionMenu}
                 formatFileSize={formatFileSize}
                 buildDownloadUrl={buildDownloadUrl}
               />

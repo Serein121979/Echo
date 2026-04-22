@@ -1,6 +1,13 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { PwaServiceWorker } from "@/components/pwa/PwaServiceWorker";
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
+};
 
 export const metadata: Metadata = {
   title: "Echo - 极简跨设备消息箱",
@@ -23,7 +30,7 @@ export default function RootLayout({
       lang="zh-CN"
       className="h-full antialiased"
     >
-      <body className="min-h-full flex flex-col bg-background text-foreground">
+      <body className="min-h-full overflow-hidden flex flex-col bg-background text-foreground">
         {children}
         <PwaServiceWorker />
       </body>
