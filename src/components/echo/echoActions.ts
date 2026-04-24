@@ -53,7 +53,7 @@ export type EchoActionsContext = {
   editingContent: string;
   noteActionId: string | null;
   input: string;
-  pendingFile: File | null;
+  pendingFiles: File[];
   isCreatingFolder: boolean;
   isCreatingTag: boolean;
   isSavingRule: boolean;
@@ -83,7 +83,7 @@ export type EchoActionsContext = {
   setIsCreatingTag: (value: boolean) => void;
   setIsSavingRule: (value: boolean) => void;
   setNoteActionId: (value: string | null) => void;
-  setPendingFile: (value: File | null) => void;
+  setPendingFiles: (value: File[] | ((current: File[]) => File[])) => void;
   setError: (value: string | null) => void;
   setNotice: (value: string | null) => void;
   setIsSidebarOpen: (value: boolean) => void;
@@ -118,15 +118,29 @@ export function createEchoActions(ctx: EchoActionsContext) {
     return data as TagItem;
   };
 
-  const queuePendingFile = (file: File) => {
-    if (file.size > MAX_FILE_SIZE_BYTES) {
-      ctx.setError("文件不能超过 50MB。");
+  const queuePendingFiles = (files: File[]) => {
+    const acceptedFiles: File[] = [];
+
+    for (const file of files) {
+      if (file.size > MAX_FILE_SIZE_BYTES) {
+        ctx.setError(`文件“${file.name}”不能超过 50MB。`);
+        return false;
+      }
+
+      acceptedFiles.push(file);
+    }
+
+    if (acceptedFiles.length === 0) {
       return false;
     }
 
-    ctx.setPendingFile(file);
+    ctx.setPendingFiles((current) => [...current, ...acceptedFiles]);
     ctx.setError(null);
-    ctx.setNotice(`已选择附件：${file.name}`);
+    ctx.setNotice(
+      acceptedFiles.length === 1
+        ? `已选择附件：${acceptedFiles[0].name}`
+        : `已加入 ${acceptedFiles.length} 个附件。`,
+    );
     return true;
   };
 
@@ -630,44 +644,71 @@ export function createEchoActions(ctx: EchoActionsContext) {
   };
 
   const handleSend = async () => {
-    if ((!ctx.input.trim() && !ctx.pendingFile) || ctx.isSending) return;
+    if ((!ctx.input.trim() && ctx.pendingFiles.length === 0) || ctx.isSending) return;
 
     ctx.setIsSending(true);
     ctx.setError(null);
     ctx.setNotice(null);
 
     const content = ctx.input.trim();
-    const payload: {
-      content: string;
-      folder_id?: string | null;
-      file_path?: string;
-      file_url?: string;
-      file_name?: string;
-      file_type?: string;
-      file_size?: number;
-    } = { content };
-
-    if (ctx.supportsFolders) {
-      payload.folder_id = ctx.selectedFolderId || null;
-    }
 
     try {
       const supabase = getSupabaseClient();
       if (!supabase) throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
 
-      if (ctx.pendingFile) {
-        Object.assign(payload, await uploadPendingFile(ctx.pendingFile));
+      const createdIds: string[] = [];
+
+      if (ctx.pendingFiles.length === 0) {
+        const payload: {
+          content: string;
+          folder_id?: string | null;
+        } = { content };
+
+        if (ctx.supportsFolders) {
+          payload.folder_id = ctx.selectedFolderId || null;
+        }
+
+        const { data, error } = await supabase.from("notes").insert([payload]).select("id").single();
+        if (error) throw error;
+        if (data?.id) {
+          createdIds.push(data.id as string);
+        }
+      } else {
+        for (const [index, file] of ctx.pendingFiles.entries()) {
+          const payload: {
+            content: string;
+            folder_id?: string | null;
+            file_path?: string;
+            file_url?: string;
+            file_name?: string;
+            file_type?: string;
+            file_size?: number;
+          } = {
+            content: index === 0 ? content : "",
+          };
+
+          if (ctx.supportsFolders) {
+            payload.folder_id = ctx.selectedFolderId || null;
+          }
+
+          Object.assign(payload, await uploadPendingFile(file));
+
+          const { data, error } = await supabase.from("notes").insert([payload]).select("id").single();
+          if (error) throw error;
+          if (data?.id) {
+            createdIds.push(data.id as string);
+          }
+        }
       }
 
-      const { data, error } = await supabase.from("notes").insert([payload]).select("id").single();
-      if (error) throw error;
-
       ctx.setInput("");
-      ctx.setPendingFile(null);
+      ctx.setPendingFiles([]);
 
-      if (ctx.supportsTags && data?.id) {
+      if (ctx.supportsTags && createdIds.length > 0) {
         const autoTags = inferAutoTags(content, ctx.effectiveAutoTagRules);
-        await applyTagsToNote(data.id as string, autoTags);
+        for (const noteId of createdIds) {
+          await applyTagsToNote(noteId, autoTags);
+        }
       }
 
       ctx.requestScrollToBottom();
@@ -688,20 +729,20 @@ export function createEchoActions(ctx: EchoActionsContext) {
   };
 
   const handleComposerPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
-    const file = Array.from(e.clipboardData.items)
+    const files = Array.from(e.clipboardData.items)
       .map((item) => item.getAsFile())
-      .find((candidate): candidate is File => Boolean(candidate && candidate.type.startsWith("image/")));
-    if (!file) return;
+      .filter((candidate): candidate is File => Boolean(candidate && candidate.type.startsWith("image/")));
+    if (files.length === 0) return;
 
     e.preventDefault();
-    queuePendingFile(file);
+    queuePendingFiles(files);
   };
 
   const handleFileInputChange = (e: ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = Array.from(e.target.files ?? []);
+    if (files.length === 0) return;
 
-    queuePendingFile(file);
+    queuePendingFiles(files);
     e.target.value = "";
   };
 
@@ -727,7 +768,7 @@ export function createEchoActions(ctx: EchoActionsContext) {
 
   return {
     ensureTag,
-    queuePendingFile,
+    queuePendingFiles,
     applyTagsToNote,
     syncAutoTagsForNote,
     uploadPendingFile,

@@ -7,14 +7,14 @@ type EchoComposerProps = {
   folders: FolderItem[];
   supportsFolders: boolean;
   selectedFolderId: string;
-  pendingFile: File | null;
+  pendingFiles: File[];
   input: string;
   isSending: boolean;
   onChangeInput: (value: string) => void;
   onChangeSelectedFolderId: (value: string) => void;
   onOpenFilePicker: () => void;
   onOpenSidebar: () => void;
-  onRemovePendingFile: () => void;
+  onRemovePendingFile: (index: number) => void;
   onSend: () => void;
   onComposerKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => void;
   onComposerPaste: (e: ClipboardEvent<HTMLTextAreaElement>) => void;
@@ -26,7 +26,7 @@ export function EchoComposer({
   folders,
   supportsFolders,
   selectedFolderId,
-  pendingFile,
+  pendingFiles,
   input,
   isSending,
   onChangeInput,
@@ -108,6 +108,7 @@ export function EchoComposer({
                 ref={fileInputRef}
                 className="hidden"
                 type="file"
+                multiple
                 onChange={onFileInputChange}
               />
               <textarea
@@ -146,26 +147,33 @@ export function EchoComposer({
               className="flex h-10 w-10 items-center justify-center rounded-full bg-neutral-950 text-white disabled:cursor-not-allowed disabled:opacity-50"
               type="button"
               onClick={onSend}
-              disabled={(!input.trim() && !pendingFile) || isSending}
+              disabled={(!input.trim() && pendingFiles.length === 0) || isSending}
               aria-label={isSending ? "发送中" : "发送"}
             >
               <Send size={18} />
             </button>
           </div>
 
-          {pendingFile ? (
-            <div className="flex items-center justify-between gap-3 rounded-2xl border border-neutral-200 bg-white px-3 py-2">
-              <div className="min-w-0">
-                <p className="truncate text-sm font-medium text-neutral-900">{pendingFile.name}</p>
-              </div>
-              <button
-                className="rounded-full border border-neutral-200 bg-white p-2 text-neutral-500"
-                type="button"
-                onClick={onRemovePendingFile}
-                aria-label="移除附件"
-              >
-                <X size={16} />
-              </button>
+          {pendingFiles.length > 0 ? (
+            <div className="space-y-2">
+              {pendingFiles.map((file, index) => (
+                <div
+                  key={`${file.name}-${file.size}-${index}`}
+                  className="flex items-center justify-between gap-3 rounded-2xl border border-neutral-200 bg-white px-3 py-2"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium text-neutral-900">{file.name}</p>
+                  </div>
+                  <button
+                    className="rounded-full border border-neutral-200 bg-white p-2 text-neutral-500"
+                    type="button"
+                    onClick={() => onRemovePendingFile(index)}
+                    aria-label={`移除附件 ${file.name}`}
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              ))}
             </div>
           ) : null}
         </div>

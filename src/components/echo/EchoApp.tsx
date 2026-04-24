@@ -70,7 +70,7 @@ export function EchoApp() {
   const [supportsTags, setSupportsTags] = useState(false);
   const [supportsAutoTagRules, setSupportsAutoTagRules] = useState(false);
   const [supportsSoftDelete, setSupportsSoftDelete] = useState(false);
-  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [openActionMenuNoteId, setOpenActionMenuNoteId] = useState<string | null>(null);
   const [scrollToBottomToken, setScrollToBottomToken] = useState(0);
@@ -156,8 +156,8 @@ export function EchoApp() {
     setOpenActionMenuNoteId(null);
   }, []);
 
-  const removePendingFile = useCallback(() => {
-    setPendingFile(null);
+  const removePendingFile = useCallback((index: number) => {
+    setPendingFiles((current) => current.filter((_, currentIndex) => currentIndex !== index));
   }, []);
 
   const handleMainPanelScroll = useCallback((e: UIEvent<HTMLDivElement>) => {
@@ -400,7 +400,7 @@ export function EchoApp() {
     editingContent,
     noteActionId,
     input,
-    pendingFile,
+    pendingFiles,
     isCreatingFolder,
     isCreatingTag,
     isSavingRule,
@@ -430,7 +430,7 @@ export function EchoApp() {
     setIsCreatingTag,
     setIsSavingRule,
     setNoteActionId,
-    setPendingFile,
+    setPendingFiles,
     setError,
     setNotice,
     setIsSidebarOpen,
@@ -564,7 +564,7 @@ export function EchoApp() {
           folders={folders}
           supportsFolders={supportsFolders}
           selectedFolderId={selectedFolderId}
-          pendingFile={pendingFile}
+          pendingFiles={pendingFiles}
           input={input}
           isSending={isSending}
           onChangeInput={setInput}

@@ -1,6 +1,7 @@
-import { Archive, Folder, MoreHorizontal, Pencil, Paperclip, Send, Star, Trash2, X } from "lucide-react";
+import { Archive, Copy, Folder, MoreHorizontal, Paperclip, Pencil, Send, Star, Trash2, X } from "lucide-react";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
+import { useState } from "react";
 import type { FolderItem, Note, TagItem } from "./types";
 
 type EchoNoteCardProps = {
@@ -60,6 +61,32 @@ export function EchoNoteCard({
   formatFileSize,
   buildDownloadUrl,
 }: EchoNoteCardProps) {
+  const [isCopyingImage, setIsCopyingImage] = useState(false);
+
+  const copyImage = async () => {
+    if (!note.fileUrl || !note.fileType?.startsWith("image/") || isCopyingImage) {
+      return;
+    }
+
+    if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+      window.open(note.fileUrl, "_blank", "noopener,noreferrer");
+      return;
+    }
+
+    try {
+      setIsCopyingImage(true);
+      const response = await fetch(note.fileUrl);
+      const blob = await response.blob();
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          [blob.type || "image/png"]: blob,
+        }),
+      ]);
+    } finally {
+      setIsCopyingImage(false);
+    }
+  };
+
   return (
     <article className="flex gap-3">
       <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl bg-neutral-950">
@@ -121,15 +148,30 @@ export function EchoNoteCard({
                         {formatFileSize(note.fileSize) ? ` · ${formatFileSize(note.fileSize)}` : ""}
                       </p>
                     </div>
-                    <a
-                      className="inline-flex items-center justify-center rounded-full bg-neutral-950 px-4 py-2 text-xs text-white"
-                      href={buildDownloadUrl(note.fileUrl, note.fileName)}
-                      download={note.fileName}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      下载
-                    </a>
+                    <div className="flex flex-wrap gap-2">
+                      {note.fileType?.startsWith("image/") ? (
+                        <button
+                          className="inline-flex items-center justify-center gap-1 rounded-full border border-neutral-200 px-4 py-2 text-xs text-neutral-700 disabled:opacity-50"
+                          type="button"
+                          onClick={() => {
+                            void copyImage();
+                          }}
+                          disabled={isCopyingImage}
+                        >
+                          <Copy size={12} />
+                          {isCopyingImage ? "复制中" : "复制图片"}
+                        </button>
+                      ) : null}
+                      <a
+                        className="inline-flex items-center justify-center rounded-full bg-neutral-950 px-4 py-2 text-xs text-white"
+                        href={buildDownloadUrl(note.fileUrl, note.fileName)}
+                        download={note.fileName}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        下载
+                      </a>
+                    </div>
                   </div>
                 </div>
               ) : null}
