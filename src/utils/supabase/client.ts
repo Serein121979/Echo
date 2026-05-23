@@ -21,7 +21,9 @@ function isConfiguredKey(value?: string) {
 // The app currently uses Supabase without generated database types.
 // Keep the client wide enough for inserts/updates until typed schema is added.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-let cachedClient: ReturnType<typeof createClient<any>> | null = null;
+type SupabaseClientAny = ReturnType<typeof createClient<any>>;
+
+let cachedClient: SupabaseClientAny | null = null;
 
 export const supabaseConfigError =
   isValidUrl(supabaseUrl) && isConfiguredKey(supabaseAnonKey)
@@ -38,6 +40,12 @@ export function getSupabaseClient() {
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  cachedClient = createClient<any>(supabaseUrl!, supabaseAnonKey!);
+  cachedClient = createClient<any>(supabaseUrl!, supabaseAnonKey!, {
+    auth: {
+      persistSession: true,
+      autoRefreshToken: true,
+      detectSessionInUrl: true,
+    },
+  });
   return cachedClient;
 }

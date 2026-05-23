@@ -97,6 +97,32 @@ create table if not exists public.note_tags (
   primary key (note_id, tag_id)
 );
 
+create table if not exists public.clips (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  content text not null,
+  kind text not null default 'text',
+  content_hash text not null,
+  source_device_id text not null,
+  source_platform text not null,
+  is_pinned boolean not null default false,
+  created_at timestamptz not null default timezone('utc', now()),
+  deleted_at timestamptz,
+  constraint clips_kind_check check (kind in ('text', 'code'))
+);
+
+create index if not exists clips_user_created_idx
+  on public.clips (user_id, created_at desc);
+
+create index if not exists clips_user_pinned_idx
+  on public.clips (user_id, is_pinned, created_at desc);
+
+create index if not exists clips_user_deleted_idx
+  on public.clips (user_id, deleted_at);
+
+create index if not exists clips_hash_device_idx
+  on public.clips (content_hash, source_device_id, created_at desc);
+
 create or replace function public.set_updated_at()
 returns trigger
 language plpgsql
@@ -178,6 +204,7 @@ alter table public.folders enable row level security;
 alter table public.tags enable row level security;
 alter table public.note_tags enable row level security;
 alter table public.auto_tag_rules enable row level security;
+alter table public.clips enable row level security;
 
 do $$
 begin
@@ -252,6 +279,51 @@ begin
     using (bucket_id = 'echo-files')
     with check (bucket_id = 'echo-files');
   end if;
+
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'clips' and policyname = 'Users can view their own clips'
+  ) then
+    create policy "Users can view their own clips"
+    on public.clips
+    for select
+    to authenticated
+    using (auth.uid() = user_id);
+  end if;
+
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'clips' and policyname = 'Users can insert their own clips'
+  ) then
+    create policy "Users can insert their own clips"
+    on public.clips
+    for insert
+    to authenticated
+    with check (auth.uid() = user_id);
+  end if;
+
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'clips' and policyname = 'Users can update their own clips'
+  ) then
+    create policy "Users can update their own clips"
+    on public.clips
+    for update
+    to authenticated
+    using (auth.uid() = user_id)
+    with check (auth.uid() = user_id);
+  end if;
+
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'clips' and policyname = 'Users can delete their own clips'
+  ) then
+    create policy "Users can delete their own clips"
+    on public.clips
+    for delete
+    to authenticated
+    using (auth.uid() = user_id);
+  end if;
 end
 $$;
 
@@ -300,6 +372,15 @@ begin
     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'auto_tag_rules'
   ) then
     execute 'alter publication supabase_realtime add table public.auto_tag_rules';
+  end if;
+
+  if exists (
+    select 1 from pg_publication where pubname = 'supabase_realtime'
+  ) and not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'clips'
+  ) then
+    execute 'alter publication supabase_realtime add table public.clips';
   end if;
 end
 $$;

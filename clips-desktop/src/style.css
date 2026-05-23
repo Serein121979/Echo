@@ -1,0 +1,388 @@
+:root {
+  color-scheme: light;
+  --bg: #f3f3f1;
+  --panel: #ffffff;
+  --panel-muted: #f7f7f6;
+  --line: #d8d8d2;
+  --text: #111111;
+  --text-muted: #66645f;
+  --accent: #0f172a;
+  --accent-soft: #e7eefb;
+  --success: #0f766e;
+  --success-soft: #dff5f2;
+  --danger: #b42318;
+  --danger-soft: #fee4e2;
+  --warning: #92400e;
+  --warning-soft: #fff1d6;
+  font-family: "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: radial-gradient(circle at top, #fafaf8 0, var(--bg) 55%);
+  color: var(--text);
+}
+
+body {
+  min-width: 360px;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+.shell {
+  min-height: 100vh;
+  padding: 18px;
+}
+
+.frame {
+  display: grid;
+  gap: 16px;
+}
+
+.hero,
+.panel,
+.status-banner,
+.empty-card {
+  border: 1px solid var(--line);
+  border-radius: 28px;
+  background: var(--panel);
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06);
+}
+
+.hero {
+  padding: 18px 18px 16px;
+}
+
+.eyebrow {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.title-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-top: 12px;
+}
+
+.title-row h1,
+.title-row h2 {
+  margin: 0;
+  font-size: 26px;
+  line-height: 1.15;
+  letter-spacing: -0.03em;
+}
+
+.hero-subtitle,
+.panel-subtitle {
+  margin: 10px 0 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-muted);
+}
+
+.status-pill {
+  border-radius: 999px;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.status-pill.neutral {
+  background: var(--panel-muted);
+  color: var(--text-muted);
+}
+
+.status-pill.success {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.status-pill.warning {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.status-pill.danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.meta-grid {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.meta-card {
+  padding: 12px 14px;
+  border-radius: 20px;
+  background: var(--panel-muted);
+}
+
+.meta-card strong {
+  display: block;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.meta-card span {
+  display: block;
+  margin-top: 6px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.status-banner {
+  padding: 14px 16px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.status-banner.neutral {
+  color: var(--text-muted);
+}
+
+.status-banner.success {
+  background: var(--success-soft);
+  border-color: #b9e3dc;
+  color: var(--success);
+}
+
+.status-banner.warning {
+  background: var(--warning-soft);
+  border-color: #f4d7a1;
+  color: var(--warning);
+}
+
+.status-banner.danger {
+  background: var(--danger-soft);
+  border-color: #f2b7b1;
+  color: var(--danger);
+}
+
+.panel {
+  padding: 18px;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.counter {
+  padding: 8px 11px;
+  border-radius: 999px;
+  background: var(--panel-muted);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.action-row,
+.toggle-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.action-row {
+  margin-top: 16px;
+}
+
+.toggle-row {
+  margin-top: 14px;
+}
+
+.button,
+.button-secondary,
+.button-danger {
+  border-radius: 999px;
+  padding: 11px 14px;
+  border: 1px solid transparent;
+  font-size: 13px;
+  font-weight: 600;
+  transition: 0.16s ease;
+}
+
+.button {
+  background: var(--accent);
+  color: #fff;
+}
+
+.button:hover {
+  background: #1e293b;
+}
+
+.button-secondary {
+  background: var(--panel);
+  border-color: var(--line);
+  color: var(--text);
+}
+
+.button-secondary:hover {
+  border-color: var(--accent);
+}
+
+.button-danger {
+  background: var(--panel);
+  border-color: #efc0bb;
+  color: var(--danger);
+}
+
+.button-danger:hover {
+  border-color: var(--danger);
+}
+
+.button:disabled,
+.button-secondary:disabled,
+.button-danger:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  border-radius: 999px;
+  padding: 10px 14px;
+  background: var(--panel-muted);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.toggle input {
+  margin: 0;
+}
+
+.list {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.clip-card {
+  border-radius: 24px;
+  border: 1px solid var(--line);
+  background: var(--panel-muted);
+  padding: 14px;
+}
+
+.clip-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.chip {
+  border-radius: 999px;
+  background: #e6e6e2;
+  color: #3e3d38;
+  padding: 5px 9px;
+  font-weight: 600;
+  text-transform: lowercase;
+}
+
+.clip-body {
+  margin-top: 12px;
+}
+
+.clip-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.clip-code {
+  margin: 0;
+  padding: 12px;
+  border-radius: 18px;
+  background: #0f172a;
+  color: #e2e8f0;
+  font: 12px/1.7 "SFMono-Regular", Menlo, Consolas, monospace;
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+
+.clip-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.empty-card {
+  padding: 18px;
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--text-muted);
+}
+
+.auth-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.field {
+  display: grid;
+  gap: 8px;
+}
+
+.field label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.field input {
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--panel);
+  padding: 12px 14px;
+  color: var(--text);
+  outline: none;
+}
+
+.field input:focus {
+  border-color: var(--accent);
+}
+
+.stack {
+  display: grid;
+  gap: 16px;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.mono {
+  font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+}
