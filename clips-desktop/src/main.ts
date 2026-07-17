@@ -11,6 +11,7 @@ import { createClient, type Session, type SupabaseClient } from "@supabase/supab
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { load } from "@tauri-apps/plugin-store";
 import * as tus from "tus-js-client";
 
@@ -25,6 +26,16 @@ const MAX_FILE_SIZE = 500 * 1024 * 1024;
 
 type ClipKind = "text" | "code";
 
+type AttachmentRecord = {
+  id: string;
+  storagePath: string;
+  fileName: string;
+  fileType: string;
+  fileSize: number;
+  uploadStatus: string;
+  signedUrl: string | null;
+};
+
 type ClipRecord = {
   id: string;
   content: string;
@@ -34,6 +45,7 @@ type ClipRecord = {
   sourcePlatform: string;
   isPinned: boolean;
   createdAt: string;
+  attachments: AttachmentRecord[];
 };
 
 type PendingClip = {
@@ -130,6 +142,14 @@ function formatTimestamp(value: string) {
   }).format(date);
 }
 
+function formatFileSize(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+  const amount = value / 1024 ** index;
+  return `${amount >= 10 || index === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[index]}`;
+}
+
 function shortenDeviceId(value: string) {
   return value ? value.slice(0, 8) : "device";
 }
@@ -173,6 +193,10 @@ function createDefaultState(): PersistedState {
 }
 
 function getErrorMessage(error: unknown, fallback: string) {
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+
   if (error instanceof Error && error.message) {
     return error.message;
   }
@@ -187,10 +211,34 @@ function getErrorMessage(error: unknown, fallback: string) {
     return error.message;
   }
 
+  if (typeof error === "object" && error !== null) {
+    try {
+      const serialized = JSON.stringify(error);
+      if (serialized && serialized !== "{}") return serialized;
+    } catch {
+      // Fall through to the user-facing fallback below.
+    }
+  }
+
   return fallback;
 }
 
+function mapAttachmentRecord(row: Record<string, unknown>): AttachmentRecord {
+  return {
+    id: String(row.id),
+    storagePath: typeof row.storage_path === "string" ? row.storage_path : "",
+    fileName: typeof row.file_name === "string" ? row.file_name : "未命名文件",
+    fileType: typeof row.file_type === "string" ? row.file_type : "application/octet-stream",
+    fileSize: typeof row.file_size === "number" ? row.file_size : Number(row.file_size) || 0,
+    uploadStatus: typeof row.upload_status === "string" ? row.upload_status : "ready",
+    signedUrl: null,
+  };
+}
+
 function mapClipRecord(row: Record<string, unknown>): ClipRecord {
+  const attachmentRows = Array.isArray(row.attachments)
+    ? row.attachments.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+    : [];
   return {
     id: String(row.id),
     content: typeof row.content === "string" ? row.content : "",
@@ -200,6 +248,7 @@ function mapClipRecord(row: Record<string, unknown>): ClipRecord {
     sourcePlatform: typeof row.source_platform === "string" ? row.source_platform : "",
     isPinned: Boolean(row.is_starred),
     createdAt: typeof row.created_at === "string" ? row.created_at : new Date().toISOString(),
+    attachments: attachmentRows.map(mapAttachmentRecord),
   };
 }
 
@@ -213,6 +262,8 @@ let pinnedClips: ClipRecord[] = [];
 let recentClips: ClipRecord[] = [];
 const busyActionIds = new Set<string>();
 let authDraft = { email: "", password: "" };
+let messageDraft = "";
+let messageSending = false;
 let clipboardTimer: number | null = null;
 let lastObservedClipboard = "";
 let notificationGranted = false;
@@ -255,23 +306,42 @@ function upsertTimedHash(collection: TimedHash[], hash: string, ttlMs: number) {
 }
 
 function renderClipCard(clip: ClipRecord) {
-  const contentHtml =
-    clip.kind === "code"
+  const hasContent = Boolean(clip.content.trim());
+  const contentHtml = hasContent
+    ? clip.kind === "code"
       ? `<pre class="clip-code">${escapeHtml(clip.content)}</pre>`
-      : `<p class="clip-text">${escapeHtml(clip.content)}</p>`;
+      : `<p class="clip-text">${escapeHtml(clip.content)}</p>`
+    : "";
+  const attachmentHtml = clip.attachments.length > 0
+    ? `<div class="attachment-grid">${clip.attachments.map((attachment) => {
+        const isImage = attachment.fileType.startsWith("image/");
+        const ready = Boolean(attachment.signedUrl);
+        return `
+          <button class="attachment-card${isImage ? " image" : ""}" data-action="open-attachment" data-attachment-id="${escapeHtml(attachment.id)}" ${ready ? "" : "disabled"}>
+            ${isImage && ready ? `<img src="${escapeHtml(attachment.signedUrl!)}" alt="${escapeHtml(attachment.fileName)}" loading="lazy" />` : `<span class="file-mark">${escapeHtml(attachment.fileName.split(".").pop()?.slice(0, 4).toUpperCase() || "FILE")}</span>`}
+            <span class="attachment-copy">
+              <strong>${escapeHtml(attachment.fileName)}</strong>
+              <small>${escapeHtml(formatFileSize(attachment.fileSize))}${ready ? " · 点击打开" : " · 正在准备预览"}</small>
+            </span>
+          </button>
+        `;
+      }).join("")}</div>`
+    : "";
   const clipBusy = busyActionIds.has(clip.id);
+  const kindLabel = hasContent ? clip.kind : clip.attachments.length > 0 ? "文件" : "消息";
 
   return `
     <article class="clip-card">
       <div class="clip-meta">
-        <span class="chip">${clip.kind}</span>
+        <span class="chip">${kindLabel}</span>
         <span>${escapeHtml(clip.sourcePlatform || "unknown")}</span>
         <span>#${escapeHtml(shortenDeviceId(clip.sourceDeviceId))}</span>
         <span>${escapeHtml(formatTimestamp(clip.createdAt))}</span>
       </div>
-      <div class="clip-body">${contentHtml}</div>
+      ${contentHtml ? `<div class="clip-body">${contentHtml}</div>` : ""}
+      ${attachmentHtml}
       <div class="clip-actions">
-        <button class="button-secondary" data-action="copy-clip" data-id="${clip.id}" ${clipBusy ? "disabled" : ""}>复制到本机剪切板</button>
+        ${hasContent ? `<button class="button-secondary" data-action="copy-clip" data-id="${clip.id}" ${clipBusy ? "disabled" : ""}>复制到本机剪切板</button>` : ""}
         <button class="button-secondary" data-action="${clip.isPinned ? "unpin-clip" : "pin-clip"}" data-id="${clip.id}" ${clipBusy ? "disabled" : ""}>${clip.isPinned ? "取消置顶" : "置顶"}</button>
         <button class="button-danger" data-action="delete-clip" data-id="${clip.id}" ${clipBusy ? "disabled" : ""}>删除</button>
       </div>
@@ -372,7 +442,6 @@ function renderAppView() {
             <button class="button-secondary" data-action="refresh-clips">刷新列表</button>
             <button class="button-danger" data-action="sign-out">退出当前设备登录</button>
           </div>
-          <input id="desktop-file-input" type="file" multiple hidden />
           ${pendingClipboard ? `<div class="status-banner warning"><strong>发送刚复制的内容？</strong><p>${escapeHtml(pendingClipboard.content.slice(0, 120))}</p><div class="action-row"><button class="button" data-action="confirm-clipboard">发送</button><button class="button-secondary" data-action="ignore-clipboard">忽略</button></div></div>` : ""}
           <div class="toggle-row">
             <label class="toggle">
@@ -384,6 +453,29 @@ function renderAppView() {
               开机自启
             </label>
           </div>
+        </section>
+
+        <section class="panel composer-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Send</p>
+              <div class="title-row">
+                <div>
+                  <h2>发送到其他设备</h2>
+                  <p class="panel-subtitle">直接输入消息，或选择图片和文件。发送后手机、Windows 和 Mac 会同步收到。</p>
+                </div>
+              </div>
+            </div>
+          </div>
+          <form id="message-form" class="message-composer">
+            <label class="sr-only" for="message-input">消息内容</label>
+            <textarea id="message-input" name="message" rows="4" placeholder="输入要传到手机或另一台电脑的内容…">${escapeHtml(messageDraft)}</textarea>
+            <div class="composer-actions">
+              <button class="button-secondary" type="button" data-action="choose-files">选择图片或文件</button>
+              <button class="button" type="submit" ${messageSending ? "disabled" : ""}>${messageSending ? "正在发送…" : "发送消息"}</button>
+            </div>
+          </form>
+          <input id="desktop-file-input" type="file" multiple hidden />
         </section>
 
         <section class="status-banner ${statusBanner.tone}">${escapeHtml(statusBanner.message)}</section>
@@ -580,7 +672,7 @@ async function fetchClipBuckets() {
   const buildQuery = () =>
     client
       .from("notes")
-      .select("id, content, source_device_id, source_platform, is_starred, created_at")
+      .select("id, content, source_device_id, source_platform, is_starred, created_at, attachments(id, storage_path, file_name, file_type, file_size, upload_status)")
       .eq("user_id", session.user.id)
       .is("deleted_at", null);
 
@@ -597,10 +689,26 @@ async function fetchClipBuckets() {
     throw recentResult.error;
   }
 
-  return {
+  const buckets = {
     pinned: (pinnedResult.data ?? []).map(mapClipRecord),
     recent: (recentResult.data ?? []).map(mapClipRecord),
   };
+
+  const allClips = [...buckets.pinned, ...buckets.recent];
+  const paths = [...new Set(allClips.flatMap((clip) => clip.attachments.map((item) => item.storagePath)).filter(Boolean))];
+  if (paths.length > 0) {
+    const { data, error } = await client.storage.from("echo-files").createSignedUrls(paths, 60 * 60);
+    if (!error && data) {
+      const urls = new Map(data.filter((item) => item.path && item.signedUrl).map((item) => [item.path!, item.signedUrl!]));
+      for (const clip of allClips) {
+        for (const attachment of clip.attachments) {
+          attachment.signedUrl = urls.get(attachment.storagePath) ?? null;
+        }
+      }
+    }
+  }
+
+  return buckets;
 }
 
 async function refreshClips(silent = false) {
@@ -665,6 +773,18 @@ async function subscribeToRealtime() {
           void notifyNewClip(mapClipRecord(nextRow));
         }
 
+        void refreshClips(true);
+      },
+    )
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "attachments",
+        filter: `user_id=eq.${currentSession.user.id}`,
+      },
+      () => {
         void refreshClips(true);
       },
     )
@@ -879,6 +999,35 @@ async function sendCurrentClipboard() {
   await processClipboardContent(clipboard, true);
 }
 
+async function sendTypedMessage(content: string) {
+  const normalized = content.trim();
+  if (!normalized) {
+    setStatus("warning", "请输入要发送的消息。");
+    return;
+  }
+
+  if (new TextEncoder().encode(normalized).length > MAX_SYNC_BYTES) {
+    setStatus("warning", "这段消息超过 200 KB，请改用文件发送。");
+    return;
+  }
+
+  messageSending = true;
+  render();
+  try {
+    const clip: PendingClip = {
+      content: normalized,
+      kind: detectKind(normalized),
+      hash: await sha256(normalized),
+      createdAt: new Date().toISOString(),
+    };
+    await sendClip(clip, true);
+    messageDraft = "";
+  } finally {
+    messageSending = false;
+    render();
+  }
+}
+
 function uploadDesktopFile(file: File, objectName: string) {
   return new Promise<void>((resolve, reject) => {
     if (!currentSession || !supabaseUrl) return reject(new Error("当前设备未登录"));
@@ -912,7 +1061,7 @@ async function sendDesktopFiles(files: File[]) {
       const suffix = file.name.includes(".") ? `.${file.name.split(".").pop()}` : "";
       const objectName = `${currentSession.user.id}/${new Date().toISOString().slice(0, 10)}/${crypto.randomUUID()}${suffix}`;
       await uploadDesktopFile(file, objectName);
-      const { error: attachmentError } = await supabase.from("attachments").insert({ user_id: currentSession.user.id, note_id: note.id, storage_path: objectName, file_name: file.name, file_type: file.type || "application/octet-stream", file_size: file.size });
+      const { error: attachmentError } = await supabase.from("attachments").insert({ user_id: currentSession.user.id, note_id: note.id, storage_path: objectName, file_name: file.name, file_type: file.type || "application/octet-stream", file_size: file.size, upload_status: "ready" });
       if (attachmentError) throw attachmentError;
     }
     setStatus("success", `${files.length} 个文件已发送到 Echo。`);
@@ -948,6 +1097,27 @@ async function flushPendingQueue() {
 
 function getClipById(clipId: string) {
   return [...pinnedClips, ...recentClips].find((clip) => clip.id === clipId) ?? null;
+}
+
+function getAttachmentById(attachmentId: string) {
+  return [...pinnedClips, ...recentClips]
+    .flatMap((clip) => clip.attachments)
+    .find((attachment) => attachment.id === attachmentId) ?? null;
+}
+
+async function openAttachment(attachmentId: string) {
+  const attachment = getAttachmentById(attachmentId);
+  if (!attachment?.signedUrl) {
+    setStatus("warning", "附件预览地址还没准备好，请刷新后重试。");
+    return;
+  }
+
+  try {
+    await openUrl(attachment.signedUrl);
+    setStatus("success", `已用系统默认程序打开“${attachment.fileName}”。`);
+  } catch (error) {
+    setStatus("danger", getErrorMessage(error, "打开附件失败。"));
+  }
 }
 
 async function markIgnoredHash(hash: string) {
@@ -1017,7 +1187,7 @@ async function handleLoginFormSubmit(form: HTMLFormElement) {
   const formData = new FormData(form);
   authDraft = {
     email: String(formData.get("email") ?? "").trim(),
-    password: String(formData.get("password") ?? ""),
+    password: String(formData.get("password") ?? "").trim(),
   };
 
   try {
@@ -1056,6 +1226,11 @@ async function handleToggleChange(input: HTMLInputElement) {
 function attachDomEvents() {
   root.addEventListener("input", (event) => {
     const target = event.target;
+    if (target instanceof HTMLTextAreaElement && target.id === "message-input") {
+      messageDraft = target.value;
+      return;
+    }
+
     if (!(target instanceof HTMLInputElement)) {
       return;
     }
@@ -1095,6 +1270,13 @@ function attachDomEvents() {
     if (target.id === "login-form") {
       event.preventDefault();
       void handleLoginFormSubmit(target);
+      return;
+    }
+
+    if (target.id === "message-form") {
+      event.preventDefault();
+      const formData = new FormData(target);
+      void sendTypedMessage(String(formData.get("message") ?? ""));
     }
   });
 
@@ -1113,6 +1295,12 @@ function attachDomEvents() {
 
     if (action === "copy-clip" && clipId) {
       void copyClipToLocalClipboard(clipId);
+      return;
+    }
+
+    if (action === "open-attachment") {
+      const attachmentId = actionTarget.dataset.attachmentId;
+      if (attachmentId) void openAttachment(attachmentId);
       return;
     }
 

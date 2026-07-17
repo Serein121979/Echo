@@ -27,7 +27,7 @@
       "csp": {
         "default-src": "'self' customprotocol: asset:",
         "connect-src": "ipc: http://ipc.localhost https://*.supabase.co wss://*.supabase.co",
-        "img-src": "'self' asset: http://asset.localhost blob: data:",
+        "img-src": "'self' asset: http://asset.localhost blob: data: https://*.supabase.co",
         "style-src": "'self' 'unsafe-inline'",
         "font-src": "'self' data:"
       }

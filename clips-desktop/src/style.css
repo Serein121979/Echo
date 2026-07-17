@@ -34,7 +34,8 @@ body {
 }
 
 button,
-input {
+input,
+textarea {
   font: inherit;
 }
 
@@ -224,7 +225,7 @@ button {
   border: 1px solid transparent;
   font-size: 13px;
   font-weight: 600;
-  transition: 0.16s ease;
+  transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease, opacity 0.16s ease;
 }
 
 .button {
@@ -338,6 +339,132 @@ button {
   margin-top: 12px;
 }
 
+.attachment-grid {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.attachment-card {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--panel);
+  padding: 8px;
+  color: var(--text);
+  text-align: left;
+  transition: border-color 0.16s ease, background-color 0.16s ease;
+}
+
+.attachment-card:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: #fbfbfa;
+}
+
+.attachment-card:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
+.attachment-card.image {
+  grid-template-columns: 72px minmax(0, 1fr);
+}
+
+.attachment-card img {
+  width: 72px;
+  height: 58px;
+  border-radius: 12px;
+  object-fit: cover;
+  background: var(--panel-muted);
+}
+
+.file-mark {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+}
+
+.attachment-copy {
+  min-width: 0;
+}
+
+.attachment-copy strong,
+.attachment-copy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-copy strong {
+  font-size: 12px;
+}
+
+.attachment-copy small {
+  margin-top: 5px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.composer-panel {
+  background: #fbfbfa;
+}
+
+.message-composer {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.message-composer textarea {
+  width: 100%;
+  min-height: 104px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--panel);
+  padding: 14px;
+  color: var(--text);
+  line-height: 1.6;
+  outline: none;
+}
+
+.message-composer textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(15, 23, 42, 0.08);
+}
+
+.composer-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .empty-card {
   padding: 18px;
   font-size: 13px;
@@ -385,4 +512,16 @@ button {
 
 .mono {
   font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+@media (max-width: 540px) {
+  .attachment-grid,
+  .meta-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .composer-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
 }
