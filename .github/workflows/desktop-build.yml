@@ -47,6 +47,7 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: clips-desktop/src-tauri
+          cache-on-failure: true
       - name: Verify build configuration
         shell: bash
         run: test -n "$VITE_SUPABASE_URL" && test -n "$VITE_SUPABASE_ANON_KEY"
