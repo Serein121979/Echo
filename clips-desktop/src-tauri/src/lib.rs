@@ -11,7 +11,7 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::{ipc::Response, Manager};
+use tauri::{ipc::Response, Emitter, Manager};
 
 const KEYRING_SERVICE: &str = "com.zhuanz.echo";
 const CHUNK_MANIFEST_PREFIX: &str = "echo-secure-chunks:v1:";
@@ -98,6 +98,63 @@ fn register_clipboard_path(
         size: metadata.len(),
         last_modified,
     })
+}
+
+#[tauri::command]
+fn collapse_to_orb(app: tauri::AppHandle) -> Result<(), String> {
+    let main = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Echo 主窗口不可用".to_string())?;
+    let orb = app
+        .get_webview_window("orb")
+        .ok_or_else(|| "Echo 悬浮球窗口不可用".to_string())?;
+    let position = main.outer_position().map_err(|error| error.to_string())?;
+    let size = tauri::LogicalSize::new(64.0, 64.0);
+
+    orb.set_position(position).map_err(|error| error.to_string())?;
+    orb.set_min_size(Some(size)).map_err(|error| error.to_string())?;
+    orb.set_max_size(Some(size)).map_err(|error| error.to_string())?;
+    orb.set_size(size).map_err(|error| error.to_string())?;
+    orb.set_resizable(false).map_err(|error| error.to_string())?;
+    orb.set_decorations(false).map_err(|error| error.to_string())?;
+    let _ = orb.set_shadow(false);
+    orb.set_always_on_top(true).map_err(|error| error.to_string())?;
+    let _ = orb.set_skip_taskbar(true);
+    orb.show().map_err(|error| error.to_string())?;
+    main.hide().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn expand_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    let main = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Echo 主窗口不可用".to_string())?;
+    let orb = app
+        .get_webview_window("orb")
+        .ok_or_else(|| "Echo 悬浮球窗口不可用".to_string())?;
+
+    let _ = orb.hide();
+    main.set_min_size(Some(tauri::LogicalSize::new(380.0, 600.0)))
+        .map_err(|error| error.to_string())?;
+    main.set_max_size::<tauri::LogicalSize<f64>>(None)
+        .map_err(|error| error.to_string())?;
+    main.set_size(tauri::LogicalSize::new(460.0, 720.0))
+        .map_err(|error| error.to_string())?;
+    main.set_resizable(true).map_err(|error| error.to_string())?;
+    main.show().map_err(|error| error.to_string())?;
+    main.set_focus().map_err(|error| error.to_string())?;
+    main.emit("echo-main-shown", ())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn start_orb_drag(window: tauri::WebviewWindow) -> Result<(), String> {
+    if window.label() != "orb" {
+        return Err("只有悬浮球窗口可以拖动".into());
+    }
+    window.start_dragging().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -364,6 +421,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
+            collapse_to_orb,
+            expand_main_window,
+            start_orb_drag,
             secure_storage_get,
             secure_storage_set,
             secure_storage_remove,

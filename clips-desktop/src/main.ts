@@ -3,7 +3,6 @@ import "@phosphor-icons/web/regular/style.css";
 
 import { defaultWindowIcon } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
-import { LogicalSize } from "@tauri-apps/api/dpi";
 import { Menu } from "@tauri-apps/api/menu";
 import type { TrayIconEvent } from "@tauri-apps/api/tray";
 import { TrayIcon } from "@tauri-apps/api/tray";
@@ -26,6 +25,8 @@ const CLIPBOARD_POLL_MS = 1200;
 const DEDUPE_WINDOW_MS = 10_000;
 const IGNORE_WINDOW_MS = 15_000;
 const MAX_FILE_SIZE = 500 * 1024 * 1024;
+const currentWindow = getCurrentWindow();
+const isOrbWindow = currentWindow.label === "orb";
 
 type ClipKind = "text" | "code";
 
@@ -568,7 +569,7 @@ function renderOrbView() {
   return `
     <main class="orb-shell" data-tauri-drag-region>
       <button class="echo-orb ${statusBanner.tone}${animateOrbEntry ? " enter" : ""}" type="button" data-action="expand-window" aria-label="${escapeHtml(stateLabel)}" data-tooltip="${escapeHtml(stateLabel)}" data-tauri-drag-region>
-        <span>E</span>
+        <span class="assistive-symbol" aria-hidden="true"><i></i></span>
         ${statusBanner.tone === "danger" || persistedState.pendingQueue.length > 0 ? `<i class="orb-alert"></i>` : ""}
       </button>
     </main>
@@ -677,8 +678,8 @@ function renderAppView() {
 }
 
 function render() {
-  root.innerHTML = compactMode ? renderOrbView() : currentSession ? renderAppView() : renderLoginView();
-  if (!compactMode && currentSession && stickConversationToBottom) {
+  root.innerHTML = isOrbWindow || compactMode ? renderOrbView() : currentSession ? renderAppView() : renderLoginView();
+  if (!isOrbWindow && !compactMode && currentSession && stickConversationToBottom) {
     window.requestAnimationFrame(() => {
       const conversation = root.querySelector<HTMLElement>(".conversation");
       if (conversation) conversation.scrollTop = conversation.scrollHeight;
@@ -766,10 +767,12 @@ function scheduleIdleCollapse() {
 }
 
 async function collapseToOrb() {
+  if (isOrbWindow) return;
+
   settingsOpen = false;
   clearIdleCollapseTimer();
 
-  const windowRef = getCurrentWindow();
+  const windowRef = currentWindow;
 
   if (!persistedState.settings.floatingBallEnabled) {
     await windowRef.hide();
@@ -778,44 +781,33 @@ async function collapseToOrb() {
 
   compactMode = true;
   dragActive = false;
-  animateOrbEntry = true;
-  render();
-  animateOrbEntry = false;
-  await windowRef.setMinSize(new LogicalSize(56, 56));
-  await windowRef.setResizable(false);
-  await windowRef.setDecorations(false);
-  await Promise.allSettled([
-    windowRef.setShadow(false),
-    windowRef.setAlwaysOnTop(true),
-    windowRef.setSkipTaskbar(true),
-  ]);
-  await windowRef.setSize(new LogicalSize(64, 64));
-  await windowRef.show();
+  await invoke("collapse_to_orb");
 }
 
 async function expandFromOrb() {
-  const windowRef = getCurrentWindow();
+  if (isOrbWindow) {
+    await invoke("expand_main_window");
+    return;
+  }
+
   compactMode = false;
   animateWindowEntry = true;
   render();
   animateWindowEntry = false;
-  await windowRef.setSize(new LogicalSize(460, 720));
-  await windowRef.setMinSize(new LogicalSize(380, 600));
-  await windowRef.setResizable(true);
-  await windowRef.setDecorations(false);
-  await Promise.allSettled([
-    windowRef.setShadow(true),
-    windowRef.setAlwaysOnTop(false),
-    windowRef.setSkipTaskbar(false),
-  ]);
-  await windowRef.center();
-  await windowRef.show();
-  await windowRef.setFocus();
+  await invoke("expand_main_window");
   scheduleIdleCollapse();
 }
 
 async function setupWindowChrome() {
-  const windowRef = getCurrentWindow();
+  const windowRef = currentWindow;
+
+  await windowRef.listen("echo-main-shown", () => {
+    compactMode = false;
+    animateWindowEntry = true;
+    render();
+    animateWindowEntry = false;
+    scheduleIdleCollapse();
+  });
 
   await windowRef.onCloseRequested(async (event: CloseRequestedEvent) => {
     if (isQuitting) {
@@ -1623,6 +1615,10 @@ function attachDomEvents() {
     const target = event.target;
     if (target instanceof HTMLTextAreaElement && target.id === "message-input") {
       messageDraft = target.value;
+      const sendButton = root.querySelector<HTMLButtonElement>(".send-button");
+      if (sendButton) {
+        sendButton.disabled = messageSending || (!messageDraft.trim() && pendingComposerAttachments.length === 0);
+      }
       return;
     }
 
@@ -1654,6 +1650,14 @@ function attachDomEvents() {
     if (target.id === "monitor-toggle" || target.id === "autostart-toggle" || target.id === "floating-ball-toggle") {
       void handleToggleChange(target);
     }
+  });
+
+  root.addEventListener("keydown", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLTextAreaElement) || target.id !== "message-input") return;
+    if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+    event.preventDefault();
+    root.querySelector<HTMLFormElement>("#message-form")?.requestSubmit();
   });
 
   root.addEventListener("submit", (event) => {
@@ -1837,4 +1841,43 @@ async function bootstrap() {
   }
 }
 
-void bootstrap();
+function bootstrapOrbWindow() {
+  let dragPointerId: number | null = null;
+  let dragStartX = 0;
+  let dragStartY = 0;
+
+  compactMode = true;
+  animateOrbEntry = true;
+  render();
+  animateOrbEntry = false;
+
+  root.addEventListener("dblclick", (event) => {
+    const target = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-action='expand-window']");
+    if (target) void expandFromOrb();
+  });
+  root.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    const target = (event.target as HTMLElement | null)?.closest<HTMLElement>(".echo-orb");
+    if (!target) return;
+    dragPointerId = event.pointerId;
+    dragStartX = event.clientX;
+    dragStartY = event.clientY;
+  });
+  root.addEventListener("pointermove", (event) => {
+    if (dragPointerId !== event.pointerId) return;
+    if (Math.hypot(event.clientX - dragStartX, event.clientY - dragStartY) < 4) return;
+    dragPointerId = null;
+    void invoke("start_orb_drag");
+  });
+  const clearDragPointer = () => {
+    dragPointerId = null;
+  };
+  root.addEventListener("pointerup", clearDragPointer);
+  root.addEventListener("pointercancel", clearDragPointer);
+}
+
+if (isOrbWindow) {
+  bootstrapOrbWindow();
+} else {
+  void bootstrap();
+}
