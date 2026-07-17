@@ -55,6 +55,19 @@ type PendingClip = {
   createdAt: string;
 };
 
+type NativeClipboardFile = {
+  kind: "native";
+  id: string;
+  name: string;
+  size: number;
+  type: string;
+  lastModified: number;
+};
+
+type PendingComposerAttachment =
+  | { kind: "browser"; file: File }
+  | NativeClipboardFile;
+
 type TimedHash = {
   hash: string;
   expiresAt: number;
@@ -223,6 +236,120 @@ function getErrorMessage(error: unknown, fallback: string) {
   return fallback;
 }
 
+function attachmentName(attachment: PendingComposerAttachment) {
+  return attachment.kind === "browser" ? attachment.file.name : attachment.name;
+}
+
+function attachmentSize(attachment: PendingComposerAttachment) {
+  return attachment.kind === "browser" ? attachment.file.size : attachment.size;
+}
+
+function attachmentType(attachment: PendingComposerAttachment) {
+  if (attachment.kind === "browser") return attachment.file.type || "application/octet-stream";
+  return attachment.type || "application/octet-stream";
+}
+
+function clipboardFilesFromDataTransfer(data: DataTransfer) {
+  const candidates = [
+    ...Array.from(data.files),
+    ...Array.from(data.items).flatMap((item) => {
+      if (item.kind !== "file") return [];
+      const file = item.getAsFile();
+      return file ? [file] : [];
+    }),
+  ];
+  const unique = new Map<string, File>();
+  for (const file of candidates) {
+    unique.set(`${file.name}\u0000${file.type}\u0000${file.size}\u0000${file.lastModified}`, file);
+  }
+  return Array.from(unique.values());
+}
+
+function queueComposerBrowserFiles(files: File[]) {
+  if (files.length === 0) return false;
+  const oversized = files.find((file) => file.size > MAX_FILE_SIZE);
+  if (oversized) {
+    setStatus("warning", `“${oversized.name}”超过 500MB 上限。`);
+    return false;
+  }
+  const existing = new Set(
+    pendingComposerAttachments.map((attachment) =>
+      `${attachmentName(attachment)}\u0000${attachmentSize(attachment)}`,
+    ),
+  );
+  for (const file of files) {
+    const key = `${file.name}\u0000${file.size}`;
+    if (!existing.has(key)) {
+      pendingComposerAttachments.push({ kind: "browser", file });
+      existing.add(key);
+    }
+  }
+  setStatus("neutral", files.length === 1 ? `已加入附件：${files[0].name}` : `已加入 ${files.length} 个附件。`);
+  return true;
+}
+
+function insertPastedText(target: HTMLTextAreaElement, text: string) {
+  if (!text) return;
+  const start = target.selectionStart ?? target.value.length;
+  const end = target.selectionEnd ?? start;
+  messageDraft = `${target.value.slice(0, start)}${text}${target.value.slice(end)}`;
+  target.value = messageDraft;
+  const caret = start + text.length;
+  target.setSelectionRange(caret, caret);
+  if (!target.isConnected) render();
+}
+
+async function queueNativeClipboardFiles(fallbackText: string, target: HTMLTextAreaElement) {
+  try {
+    const descriptors = await invoke<Array<{
+      id: string;
+      name: string;
+      size: number;
+      fileType: string;
+      lastModified: number;
+    }>>("clipboard_file_descriptors");
+    if (descriptors.length === 0) {
+      insertPastedText(target, fallbackText);
+      return;
+    }
+    const oversized = descriptors.find((file) => file.size > MAX_FILE_SIZE);
+    if (oversized) {
+      await Promise.allSettled(descriptors.map((file) => invoke("release_clipboard_file", { id: file.id })));
+      setStatus("warning", `“${oversized.name}”超过 500MB 上限。`);
+      return;
+    }
+    const existing = new Set(
+      pendingComposerAttachments.map((attachment) =>
+        `${attachmentName(attachment)}\u0000${attachmentSize(attachment)}`,
+      ),
+    );
+    let added = 0;
+    for (const descriptor of descriptors) {
+      const key = `${descriptor.name}\u0000${descriptor.size}`;
+      if (existing.has(key)) {
+        await invoke("release_clipboard_file", { id: descriptor.id });
+        continue;
+      }
+      pendingComposerAttachments.push({
+        kind: "native",
+        id: descriptor.id,
+        name: descriptor.name,
+        size: descriptor.size,
+        type: descriptor.fileType || "application/octet-stream",
+        lastModified: descriptor.lastModified,
+      });
+      existing.add(key);
+      added += 1;
+    }
+    if (added > 0) {
+      setStatus("neutral", added === 1 ? `已从剪贴板加入附件：${descriptors[0].name}` : `已从剪贴板加入 ${added} 个附件。`);
+    }
+  } catch (error) {
+    insertPastedText(target, fallbackText);
+    setStatus("danger", getErrorMessage(error, "读取剪贴板中的图片或文件失败。"));
+  }
+}
+
 function mapAttachmentRecord(row: Record<string, unknown>): AttachmentRecord {
   return {
     id: String(row.id),
@@ -264,6 +391,7 @@ const busyActionIds = new Set<string>();
 let authDraft = { email: "", password: "" };
 let messageDraft = "";
 let messageSending = false;
+let pendingComposerAttachments: PendingComposerAttachment[] = [];
 let clipboardTimer: number | null = null;
 let lastObservedClipboard = "";
 let notificationGranted = false;
@@ -405,6 +533,18 @@ function renderLoginView() {
 }
 
 function renderAppView() {
+  const pendingAttachmentsHtml = pendingComposerAttachments.length > 0
+    ? `<div class="pending-attachments" aria-label="待发送附件">${pendingComposerAttachments.map((attachment, index) => `
+        <div class="pending-attachment">
+          <span class="pending-file-mark">${escapeHtml(attachmentName(attachment).split(".").pop()?.slice(0, 4).toUpperCase() || "FILE")}</span>
+          <span class="pending-file-copy">
+            <strong>${escapeHtml(attachmentName(attachment))}</strong>
+            <small>${escapeHtml(formatFileSize(attachmentSize(attachment)))}</small>
+          </span>
+          <button class="remove-attachment" type="button" data-action="remove-pending-attachment" data-index="${index}" aria-label="移除 ${escapeHtml(attachmentName(attachment))}">×</button>
+        </div>
+      `).join("")}</div>`
+    : "";
   return `
     <div class="shell">
       <div class="frame">
@@ -469,7 +609,8 @@ function renderAppView() {
           </div>
           <form id="message-form" class="message-composer">
             <label class="sr-only" for="message-input">消息内容</label>
-            <textarea id="message-input" name="message" rows="4" placeholder="输入要传到手机或另一台电脑的内容…">${escapeHtml(messageDraft)}</textarea>
+            <textarea id="message-input" name="message" rows="4" placeholder="输入消息，或在这里粘贴图片和文件…">${escapeHtml(messageDraft)}</textarea>
+            ${pendingAttachmentsHtml}
             <div class="composer-actions">
               <button class="button-secondary" type="button" data-action="choose-files">选择图片或文件</button>
               <button class="button" type="submit" ${messageSending ? "disabled" : ""}>${messageSending ? "正在发送…" : "发送消息"}</button>
@@ -1050,24 +1191,91 @@ function uploadDesktopFile(file: File, objectName: string) {
   });
 }
 
-async function sendDesktopFiles(files: File[]) {
-  if (!supabase || !currentSession || files.length === 0) return;
-  const oversized = files.find((file) => file.size > MAX_FILE_SIZE);
-  if (oversized) return setStatus("warning", `“${oversized.name}”超过 500MB 上限。`);
+const nativeClipboardFileReader = {
+  async openFile(input: NativeClipboardFile) {
+    return {
+      size: input.size,
+      async slice(start: number, end: number) {
+        const raw = await invoke<ArrayBuffer | Uint8Array | number[]>("read_clipboard_file_chunk", {
+          id: input.id,
+          start,
+          end,
+        });
+        const bytes = raw instanceof ArrayBuffer
+          ? new Uint8Array(raw)
+          : raw instanceof Uint8Array
+            ? raw
+            : Uint8Array.from(raw);
+        const payload = new Uint8Array(bytes.byteLength);
+        payload.set(bytes);
+        return { value: new Blob([payload.buffer]), done: end >= input.size };
+      },
+      close() {},
+    };
+  },
+};
+
+function uploadNativeClipboardFile(file: NativeClipboardFile, objectName: string) {
+  return new Promise<void>((resolve, reject) => {
+    if (!currentSession || !supabaseUrl) return reject(new Error("当前设备未登录"));
+    const upload = new tus.Upload(file as unknown as File, {
+      endpoint: `${supabaseUrl}/storage/v1/upload/resumable`,
+      headers: { authorization: `Bearer ${currentSession.access_token}`, "x-upsert": "false" },
+      retryDelays: [0, 1000, 3000, 5000, 10000],
+      chunkSize: 6 * 1024 * 1024,
+      uploadDataDuringCreation: true,
+      removeFingerprintOnSuccess: true,
+      fileReader: nativeClipboardFileReader,
+      metadata: { bucketName: "echo-files", objectName, contentType: file.type, cacheControl: "3600" },
+      onProgress: (sent, total) => setStatus("neutral", `正在上传 ${file.name} · ${total ? Math.round(sent / total * 100) : 0}%`),
+      onError: reject,
+      onSuccess: () => resolve(),
+    });
+    upload.findPreviousUploads().then((previous) => {
+      if (previous[0]) upload.resumeFromPreviousUpload(previous[0]);
+      upload.start();
+    }).catch(reject);
+  });
+}
+
+async function sendComposerMessage(content: string) {
+  const normalized = content.trim();
+  if (pendingComposerAttachments.length === 0) {
+    await sendTypedMessage(normalized);
+    return;
+  }
+  if (!supabase || !currentSession || messageSending) return;
+  if (new TextEncoder().encode(normalized).length > MAX_SYNC_BYTES) {
+    setStatus("warning", "这段消息超过 200 KB，请改用文件发送。");
+    return;
+  }
+  const oversized = pendingComposerAttachments.find((file) => attachmentSize(file) > MAX_FILE_SIZE);
+  if (oversized) return setStatus("warning", `“${attachmentName(oversized)}”超过 500MB 上限。`);
+  messageSending = true;
+  render();
   try {
-    const { data: note, error } = await supabase.from("notes").insert({ user_id: currentSession.user.id, content: "", source_device_id: registeredDeviceId, source_platform: detectPlatform() }).select("id").single();
+    const attachments = [...pendingComposerAttachments];
+    const { data: note, error } = await supabase.from("notes").insert({ user_id: currentSession.user.id, content: normalized, source_device_id: registeredDeviceId, source_platform: detectPlatform() }).select("id").single();
     if (error) throw error;
-    for (const file of files) {
-      const suffix = file.name.includes(".") ? `.${file.name.split(".").pop()}` : "";
+    for (const file of attachments) {
+      const name = attachmentName(file);
+      const suffix = name.includes(".") ? `.${name.split(".").pop()}` : "";
       const objectName = `${currentSession.user.id}/${new Date().toISOString().slice(0, 10)}/${crypto.randomUUID()}${suffix}`;
-      await uploadDesktopFile(file, objectName);
-      const { error: attachmentError } = await supabase.from("attachments").insert({ user_id: currentSession.user.id, note_id: note.id, storage_path: objectName, file_name: file.name, file_type: file.type || "application/octet-stream", file_size: file.size, upload_status: "ready" });
+      if (file.kind === "browser") await uploadDesktopFile(file.file, objectName);
+      else await uploadNativeClipboardFile(file, objectName);
+      const { error: attachmentError } = await supabase.from("attachments").insert({ user_id: currentSession.user.id, note_id: note.id, storage_path: objectName, file_name: name, file_type: attachmentType(file), file_size: attachmentSize(file), upload_status: "ready" });
       if (attachmentError) throw attachmentError;
     }
-    setStatus("success", `${files.length} 个文件已发送到 Echo。`);
+    messageDraft = "";
+    pendingComposerAttachments = [];
+    await Promise.allSettled(attachments.filter((file): file is NativeClipboardFile => file.kind === "native").map((file) => invoke("release_clipboard_file", { id: file.id })));
+    setStatus("success", `${attachments.length} 个附件已发送到 Echo。`);
     await refreshClips(true);
   } catch (error) {
-    setStatus("danger", getErrorMessage(error, "文件发送失败。"));
+    setStatus("danger", getErrorMessage(error, "消息或附件发送失败。"));
+  } finally {
+    messageSending = false;
+    render();
   }
 }
 
@@ -1224,6 +1432,20 @@ async function handleToggleChange(input: HTMLInputElement) {
 }
 
 function attachDomEvents() {
+  root.addEventListener("paste", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLTextAreaElement) || target.id !== "message-input") return;
+    const clipboardData = event.clipboardData;
+    if (!clipboardData) return;
+    event.preventDefault();
+    const files = clipboardFilesFromDataTransfer(clipboardData);
+    if (files.length > 0) {
+      queueComposerBrowserFiles(files);
+      return;
+    }
+    void queueNativeClipboardFiles(clipboardData.getData("text/plain"), target);
+  });
+
   root.addEventListener("input", (event) => {
     const target = event.target;
     if (target instanceof HTMLTextAreaElement && target.id === "message-input") {
@@ -1251,7 +1473,7 @@ function attachDomEvents() {
     }
 
     if (target.id === "desktop-file-input") {
-      void sendDesktopFiles(Array.from(target.files ?? []));
+      queueComposerBrowserFiles(Array.from(target.files ?? []));
       target.value = "";
       return;
     }
@@ -1276,7 +1498,7 @@ function attachDomEvents() {
     if (target.id === "message-form") {
       event.preventDefault();
       const formData = new FormData(target);
-      void sendTypedMessage(String(formData.get("message") ?? ""));
+      void sendComposerMessage(String(formData.get("message") ?? ""));
     }
   });
 
@@ -1326,6 +1548,18 @@ function attachDomEvents() {
 
     if (action === "choose-files") {
       root.querySelector<HTMLInputElement>("#desktop-file-input")?.click();
+      return;
+    }
+
+    if (action === "remove-pending-attachment") {
+      const index = Number(actionTarget.dataset.index);
+      const attachment = pendingComposerAttachments[index];
+      if (!attachment) return;
+      pendingComposerAttachments.splice(index, 1);
+      if (attachment.kind === "native") {
+        void invoke("release_clipboard_file", { id: attachment.id });
+      }
+      setStatus("neutral", `已移除附件：${attachmentName(attachment)}`);
       return;
     }
 

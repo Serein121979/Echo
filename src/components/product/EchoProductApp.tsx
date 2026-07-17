@@ -1,7 +1,7 @@
 "use client";
 
 import type { Session } from "@supabase/supabase-js";
-import { Archive, Copy, Download, File, Inbox, LogOut, Paperclip, Send, Sparkles, Star, Trash2, X } from "lucide-react";
+import { Archive, Copy, Download, File as FileIcon, Inbox, LogOut, Paperclip, Send, Sparkles, Star, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getSupabaseClient, supabaseConfigError } from "@/utils/supabase/client";
 import { AiWorkspace } from "./AiWorkspace";
@@ -10,6 +10,39 @@ import type { AiSuggestion, ProductNote } from "./types";
 
 type View = "inbox" | "starred" | "archived";
 type UploadProgress = { name: string; percent: number };
+
+function clipboardImageName(type: string) {
+  const extension = type === "image/jpeg" ? "jpg" : type === "image/webp" ? "webp" : type === "image/gif" ? "gif" : "png";
+  const timestamp = new Date().toISOString().replaceAll(":", "-").replace("T", "-").slice(0, 19);
+  return `剪贴板图片-${timestamp}.${extension}`;
+}
+
+function filesFromClipboard(data: DataTransfer) {
+  const candidates = [
+    ...Array.from(data.files),
+    ...Array.from(data.items).flatMap((item) => {
+      if (item.kind !== "file") return [];
+      const file = item.getAsFile();
+      return file ? [file] : [];
+    }),
+  ];
+  const unique = new Map<string, File>();
+
+  for (const candidate of candidates) {
+    const file = candidate.name && candidate.name !== "image.png"
+      ? candidate
+      : candidate.type.startsWith("image/")
+        ? new File([candidate], clipboardImageName(candidate.type), {
+            type: candidate.type || "image/png",
+            lastModified: Date.now(),
+          })
+        : candidate;
+    const key = `${file.name}\u0000${file.type}\u0000${file.size}`;
+    unique.set(key, file);
+  }
+
+  return Array.from(unique.values());
+}
 
 function platformName() {
   if (typeof navigator === "undefined") return "web";
@@ -147,10 +180,23 @@ export function EchoProductApp() {
   }
 
   function addFiles(files: File[]) {
+    if (files.length === 0) return;
     const oversized = files.find((file) => file.size > MAX_FILE_SIZE);
     if (oversized) return setError(`“${oversized.name}”超过 500MB 上限。`);
-    setPendingFiles((current) => [...current, ...files]);
+    setPendingFiles((current) => {
+      const unique = new Map(current.map((file) => [`${file.name}\u0000${file.type}\u0000${file.size}`, file]));
+      for (const file of files) unique.set(`${file.name}\u0000${file.type}\u0000${file.size}`, file);
+      return Array.from(unique.values());
+    });
     setError(null);
+    setNotice(files.length === 1 ? `已加入附件：${files[0].name}` : `已加入 ${files.length} 个附件。`);
+  }
+
+  function handleComposerPaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const files = filesFromClipboard(event.clipboardData);
+    if (files.length === 0) return;
+    event.preventDefault();
+    addFiles(files);
   }
 
   async function analyzeNote(noteId: string, attachmentIds: string[]) {
@@ -254,7 +300,7 @@ export function EchoProductApp() {
           {isLoading ? <div className="space-y-4">{[1,2,3].map((item) => <div key={item} className="h-24 animate-pulse rounded-2xl bg-[var(--surface-muted)]" />)}</div> : visibleNotes.length === 0 ? <div className="mx-auto max-w-sm py-20 text-center"><div className="echo-empty-mark mx-auto">E</div><h2 className="mt-5 font-semibold">{query ? "没有找到匹配内容" : "这里还没有消息"}</h2><p className="mt-2 text-sm leading-6 text-[var(--muted)]">从任意设备发送文字或文件，它会立即同步到这里。</p></div> : <div className="space-y-4">{visibleNotes.map((note) => (
             <article key={note.id} data-note-id={note.id} className={`rounded-2xl border bg-[var(--surface-raised)] p-4 transition ${highlightedId === note.id ? "border-[var(--accent)] ring-4 ring-blue-500/10" : "border-[var(--line)]"}`}>
               <div className="flex items-start gap-3"><div className="min-w-0 flex-1">{note.content ? <p className="whitespace-pre-wrap break-words text-sm leading-7">{note.content}</p> : null}{note.summary ? <p className="mt-2 text-xs leading-5 text-[var(--muted)]">AI 摘要：{note.summary}</p> : null}</div><button onClick={() => void navigator.clipboard.writeText(note.content)} className="text-[var(--muted)] hover:text-[var(--ink)]" aria-label="复制正文"><Copy size={16} /></button></div>
-              {note.attachments.length > 0 ? <div className="mt-3 grid gap-2 sm:grid-cols-2">{note.attachments.map((attachment) => <button key={attachment.id} onClick={() => void downloadAttachment(attachment.id)} className="flex min-w-0 items-center gap-3 rounded-xl border border-[var(--line)] bg-[var(--surface)] p-3 text-left"><div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-[var(--surface-muted)]"><File size={17} /></div><div className="min-w-0 flex-1"><p className="truncate text-xs font-medium">{attachment.file_name}</p><p className="mt-1 text-[10px] text-[var(--muted)]">{formatSize(attachment.file_size)} · {attachment.extraction_status === "ready" ? "已建立索引" : attachment.extraction_status === "failed" ? "解析失败" : "等待解析"}</p></div><Download size={15} /></button>)}</div> : null}
+              {note.attachments.length > 0 ? <div className="mt-3 grid gap-2 sm:grid-cols-2">{note.attachments.map((attachment) => <button key={attachment.id} onClick={() => void downloadAttachment(attachment.id)} className="flex min-w-0 items-center gap-3 rounded-xl border border-[var(--line)] bg-[var(--surface)] p-3 text-left"><div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-[var(--surface-muted)]"><FileIcon size={17} /></div><div className="min-w-0 flex-1"><p className="truncate text-xs font-medium">{attachment.file_name}</p><p className="mt-1 text-[10px] text-[var(--muted)]">{formatSize(attachment.file_size)} · {attachment.extraction_status === "ready" ? "已建立索引" : attachment.extraction_status === "failed" ? "解析失败" : "等待解析"}</p></div><Download size={15} /></button>)}</div> : null}
               {note.tags.length ? <div className="mt-3 flex flex-wrap gap-1.5">{note.tags.map((tag) => <span key={tag.id} className="rounded-md bg-[var(--surface-muted)] px-2 py-1 text-[10px]">#{tag.name}</span>)}</div> : null}
               <footer className="mt-4 flex items-center gap-3 border-t border-[var(--line)] pt-3 text-[10px] text-[var(--muted)]"><span>来自 {note.source_platform}</span><span>{new Date(note.created_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}</span><div className="ml-auto flex gap-2"><button onClick={() => void updateNote(note.id, { is_starred: !note.is_starred })} aria-label="收藏"><Star size={15} className={note.is_starred ? "fill-current text-amber-500" : ""} /></button><button onClick={() => void updateNote(note.id, { is_archived: !note.is_archived })} aria-label="归档"><Archive size={15} /></button><button onClick={() => { if (confirm("把这条消息移到回收站？")) void updateNote(note.id, { deleted_at: new Date().toISOString() }); }} aria-label="删除"><Trash2 size={15} /></button></div></footer>
             </article>
@@ -264,7 +310,7 @@ export function EchoProductApp() {
         <footer className="shrink-0 border-t border-[var(--line)] bg-[var(--surface)] px-3 pt-3 pb-[max(.75rem,env(safe-area-inset-bottom))] sm:px-5">
           {pendingFiles.length ? <div className="mb-2 flex gap-2 overflow-x-auto">{pendingFiles.map((file, index) => <div key={`${file.name}-${index}`} className="flex max-w-56 shrink-0 items-center gap-2 rounded-lg bg-[var(--surface-muted)] px-2.5 py-2 text-xs"><span className="truncate">{file.name}</span><button onClick={() => setPendingFiles((current) => current.filter((_, currentIndex) => currentIndex !== index))}><X size={13} /></button></div>)}</div> : null}
           {uploads.length ? <div className="mb-2 space-y-1">{uploads.map((upload) => <div key={upload.name}><div className="flex justify-between text-[10px] text-[var(--muted)]"><span className="truncate">{upload.name}</span><span>{upload.percent}%</span></div><div className="mt-1 h-1 overflow-hidden rounded-full bg-[var(--surface-muted)]"><div className="h-full bg-[var(--accent)]" style={{ width: `${upload.percent}%` }} /></div></div>)}</div> : null}
-          <div className="flex items-end gap-2"><input ref={fileInputRef} className="hidden" type="file" multiple onChange={(event) => addFiles(Array.from(event.target.files ?? []))} /><button className="icon-button shrink-0" onClick={() => fileInputRef.current?.click()} aria-label="添加文件"><Paperclip size={18} /></button><textarea className="max-h-36 min-h-10 flex-1 resize-none rounded-xl border border-[var(--line)] bg-[var(--surface-raised)] px-3 py-2.5 text-sm outline-none focus:border-[var(--accent)]" rows={1} value={input} onChange={(event) => setInput(event.target.value)} onPaste={(event) => { const files = Array.from(event.clipboardData.files); if (files.length) addFiles(files); }} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder="输入消息，或粘贴文件…" />{isSending ? <button className="icon-button shrink-0" onClick={() => uploadAbortRef.current?.abort()} aria-label="取消发送"><X size={18} /></button> : <button className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-[var(--ink)] text-[var(--surface)] disabled:opacity-40" onClick={() => void send()} disabled={!input.trim() && pendingFiles.length === 0} aria-label="发送"><Send size={17} /></button>}</div>
+          <div className="flex items-end gap-2"><input ref={fileInputRef} className="hidden" type="file" multiple onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} /><button className="icon-button shrink-0" onClick={() => fileInputRef.current?.click()} aria-label="添加文件"><Paperclip size={18} /></button><textarea className="max-h-36 min-h-10 flex-1 resize-none rounded-xl border border-[var(--line)] bg-[var(--surface-raised)] px-3 py-2.5 text-sm outline-none focus:border-[var(--accent)]" rows={1} value={input} onChange={(event) => setInput(event.target.value)} onPaste={handleComposerPaste} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder="输入消息，或粘贴图片和文件…" />{isSending ? <button className="icon-button shrink-0" onClick={() => uploadAbortRef.current?.abort()} aria-label="取消发送"><X size={18} /></button> : <button className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-[var(--ink)] text-[var(--surface)] disabled:opacity-40" onClick={() => void send()} disabled={!input.trim() && pendingFiles.length === 0} aria-label="发送"><Send size={17} /></button>}</div>
         </footer>
       </div>
       {showAi ? <AiWorkspace accessToken={session.access_token} suggestions={suggestions} onClose={() => setShowAi(false)} onSuggestionHandled={() => loadData(session)} onOpenNote={openNote} /> : null}
