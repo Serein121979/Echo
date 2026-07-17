@@ -75,3 +75,42 @@ textarea {
 textarea {
   field-sizing: content;
 }
+
+.icon-button[data-tooltip],
+.web-send-button[data-tooltip] {
+  position: relative;
+}
+
+.icon-button[data-tooltip]::after,
+.web-send-button[data-tooltip]::after {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + .5rem);
+  z-index: 30;
+  width: max-content;
+  transform: translateX(-50%) translateY(.15rem);
+  border-radius: .5rem;
+  background: color-mix(in srgb, var(--ink) 94%, transparent);
+  padding: .3rem .45rem;
+  color: var(--surface);
+  content: attr(data-tooltip);
+  font-size: .625rem;
+  line-height: 1.2;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease 700ms, transform 120ms ease 700ms;
+  white-space: nowrap;
+}
+
+header .icon-button[data-tooltip]::after {
+  top: calc(100% + .5rem);
+  bottom: auto;
+}
+
+.icon-button[data-tooltip]:hover::after,
+.icon-button[data-tooltip]:focus-visible::after,
+.web-send-button[data-tooltip]:hover::after,
+.web-send-button[data-tooltip]:focus-visible::after {
+  transform: translateX(-50%) translateY(0);
+  opacity: 1;
+}

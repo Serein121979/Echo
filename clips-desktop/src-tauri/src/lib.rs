@@ -138,6 +138,26 @@ fn clipboard_file_descriptors(
 }
 
 #[tauri::command]
+fn dropped_file_descriptors(
+    paths: Vec<String>,
+    registry: tauri::State<'_, ClipboardFileRegistry>,
+) -> Result<Vec<ClipboardFileDescriptor>, String> {
+    if paths.len() > 100 {
+        return Err("一次最多拖入 100 个文件".into());
+    }
+
+    let mut descriptors = Vec::new();
+    for (sequence, value) in paths.into_iter().enumerate() {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            descriptors.push(register_clipboard_path(&registry, path, false, sequence)?);
+        }
+    }
+
+    Ok(descriptors)
+}
+
+#[tauri::command]
 fn read_clipboard_file_chunk(
     registry: tauri::State<'_, ClipboardFileRegistry>,
     id: String,
@@ -348,6 +368,7 @@ pub fn run() {
             secure_storage_set,
             secure_storage_remove,
             clipboard_file_descriptors,
+            dropped_file_descriptors,
             read_clipboard_file_chunk,
             release_clipboard_file
         ])

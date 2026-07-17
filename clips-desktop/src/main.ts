@@ -1,10 +1,13 @@
 import "./style.css";
+import "@phosphor-icons/web/regular/style.css";
 
 import { defaultWindowIcon } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { Menu } from "@tauri-apps/api/menu";
 import type { TrayIconEvent } from "@tauri-apps/api/tray";
 import { TrayIcon } from "@tauri-apps/api/tray";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { CloseRequestedEvent } from "@tauri-apps/api/window";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createClient, type Session, type SupabaseClient } from "@supabase/supabase-js";
@@ -64,6 +67,14 @@ type NativeClipboardFile = {
   lastModified: number;
 };
 
+type NativeFileDescriptor = {
+  id: string;
+  name: string;
+  size: number;
+  fileType: string;
+  lastModified: number;
+};
+
 type PendingComposerAttachment =
   | { kind: "browser"; file: File }
   | NativeClipboardFile;
@@ -81,6 +92,7 @@ type PersistedState = {
   settings: {
     monitorClipboard: boolean;
     autostartEnabled: boolean;
+    floatingBallEnabled: boolean;
     lastSeenTimestamp: string | null;
   };
 };
@@ -163,10 +175,6 @@ function formatFileSize(value: number) {
   return `${amount >= 10 || index === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[index]}`;
 }
 
-function shortenDeviceId(value: string) {
-  return value ? value.slice(0, 8) : "device";
-}
-
 function detectPlatform() {
   const agent = navigator.userAgent.toLowerCase();
 
@@ -200,6 +208,7 @@ function createDefaultState(): PersistedState {
     settings: {
       monitorClipboard: true,
       autostartEnabled: true,
+      floatingBallEnabled: true,
       lastSeenTimestamp: null,
     },
   };
@@ -301,52 +310,68 @@ function insertPastedText(target: HTMLTextAreaElement, text: string) {
 
 async function queueNativeClipboardFiles(fallbackText: string, target: HTMLTextAreaElement) {
   try {
-    const descriptors = await invoke<Array<{
-      id: string;
-      name: string;
-      size: number;
-      fileType: string;
-      lastModified: number;
-    }>>("clipboard_file_descriptors");
+    const descriptors = await invoke<NativeFileDescriptor[]>("clipboard_file_descriptors");
     if (descriptors.length === 0) {
       insertPastedText(target, fallbackText);
       return;
     }
-    const oversized = descriptors.find((file) => file.size > MAX_FILE_SIZE);
-    if (oversized) {
-      await Promise.allSettled(descriptors.map((file) => invoke("release_clipboard_file", { id: file.id })));
-      setStatus("warning", `“${oversized.name}”超过 500MB 上限。`);
-      return;
-    }
-    const existing = new Set(
-      pendingComposerAttachments.map((attachment) =>
-        `${attachmentName(attachment)}\u0000${attachmentSize(attachment)}`,
-      ),
-    );
-    let added = 0;
-    for (const descriptor of descriptors) {
-      const key = `${descriptor.name}\u0000${descriptor.size}`;
-      if (existing.has(key)) {
-        await invoke("release_clipboard_file", { id: descriptor.id });
-        continue;
-      }
-      pendingComposerAttachments.push({
-        kind: "native",
-        id: descriptor.id,
-        name: descriptor.name,
-        size: descriptor.size,
-        type: descriptor.fileType || "application/octet-stream",
-        lastModified: descriptor.lastModified,
-      });
-      existing.add(key);
-      added += 1;
-    }
-    if (added > 0) {
-      setStatus("neutral", added === 1 ? `已从剪贴板加入附件：${descriptors[0].name}` : `已从剪贴板加入 ${added} 个附件。`);
-    }
+    await queueNativeDescriptors(descriptors, "剪贴板");
   } catch (error) {
     insertPastedText(target, fallbackText);
     setStatus("danger", getErrorMessage(error, "读取剪贴板中的图片或文件失败。"));
+  }
+}
+
+async function queueNativeDescriptors(descriptors: NativeFileDescriptor[], source: "剪贴板" | "拖放") {
+  const oversized = descriptors.find((file) => file.size > MAX_FILE_SIZE);
+  if (oversized) {
+    await Promise.allSettled(descriptors.map((file) => invoke("release_clipboard_file", { id: file.id })));
+    setStatus("warning", `“${oversized.name}”超过 500MB 上限。`);
+    return;
+  }
+
+  const existing = new Set(
+    pendingComposerAttachments.map((attachment) =>
+      `${attachmentName(attachment)}\u0000${attachmentSize(attachment)}`,
+    ),
+  );
+  let added = 0;
+  for (const descriptor of descriptors) {
+    const key = `${descriptor.name}\u0000${descriptor.size}`;
+    if (existing.has(key)) {
+      await invoke("release_clipboard_file", { id: descriptor.id });
+      continue;
+    }
+    pendingComposerAttachments.push({
+      kind: "native",
+      id: descriptor.id,
+      name: descriptor.name,
+      size: descriptor.size,
+      type: descriptor.fileType || "application/octet-stream",
+      lastModified: descriptor.lastModified,
+    });
+    existing.add(key);
+    added += 1;
+  }
+
+  if (added > 0) {
+    const prefix = source === "拖放" ? "已拖入" : "已从剪贴板加入";
+    setStatus("neutral", added === 1 ? `${prefix}附件：${descriptors[0].name}` : `${prefix} ${added} 个附件。`);
+  } else {
+    render();
+  }
+}
+
+async function queueDroppedPaths(paths: string[]) {
+  try {
+    const descriptors = await invoke<NativeFileDescriptor[]>("dropped_file_descriptors", { paths });
+    if (descriptors.length === 0) {
+      setStatus("warning", "没有检测到可发送的文件。请从文件夹中拖入一个或多个文件。");
+      return;
+    }
+    await queueNativeDescriptors(descriptors, "拖放");
+  } catch (error) {
+    setStatus("danger", getErrorMessage(error, "读取拖入的文件失败。"));
   }
 }
 
@@ -401,11 +426,35 @@ let realtimeChannel: { unsubscribe: () => Promise<unknown> } | null = null;
 let registeredDeviceId: string | null = null;
 let pendingClipboard: PendingClip | null = null;
 let pendingClipboardTimer: number | null = null;
+let settingsOpen = false;
+let dragActive = false;
+let browserDragDepth = 0;
+let compactMode = false;
+let idleCollapseTimer: number | null = null;
+let stickConversationToBottom = true;
+let animateWindowEntry = false;
+let animateOrbEntry = false;
 
 function setStatus(tone: BannerTone, message: string) {
   statusBanner = { tone, message };
   void syncTrayTooltip();
   render();
+}
+
+function setDragActive(next: boolean) {
+  if (dragActive === next) return;
+  dragActive = next;
+  root.querySelector(".chat-shell")?.classList.toggle("is-dragging", next);
+  const composer = root.querySelector<HTMLElement>(".message-composer");
+  if (!composer) return;
+  const currentOverlay = composer.querySelector(".drop-overlay");
+  if (!next) {
+    currentOverlay?.remove();
+    return;
+  }
+  if (!currentOverlay) {
+    composer.insertAdjacentHTML("afterbegin", `<div class="drop-overlay"><i class="ph ph-download-simple"></i><strong>松开即可加入发送</strong><span>支持多个文件，单个最大 500MB</span></div>`);
+  }
 }
 
 async function saveState() {
@@ -435,6 +484,7 @@ function upsertTimedHash(collection: TimedHash[], hash: string, ttlMs: number) {
 
 function renderClipCard(clip: ClipRecord) {
   const hasContent = Boolean(clip.content.trim());
+  const isMine = Boolean(registeredDeviceId && clip.sourceDeviceId === registeredDeviceId);
   const contentHtml = hasContent
     ? clip.kind === "code"
       ? `<pre class="clip-code">${escapeHtml(clip.content)}</pre>`
@@ -449,29 +499,32 @@ function renderClipCard(clip: ClipRecord) {
             ${isImage && ready ? `<img src="${escapeHtml(attachment.signedUrl!)}" alt="${escapeHtml(attachment.fileName)}" loading="lazy" />` : `<span class="file-mark">${escapeHtml(attachment.fileName.split(".").pop()?.slice(0, 4).toUpperCase() || "FILE")}</span>`}
             <span class="attachment-copy">
               <strong>${escapeHtml(attachment.fileName)}</strong>
-              <small>${escapeHtml(formatFileSize(attachment.fileSize))}${ready ? " · 点击打开" : " · 正在准备预览"}</small>
+              <small>${escapeHtml(formatFileSize(attachment.fileSize))}${ready ? "，点击打开" : "，正在准备"}</small>
             </span>
           </button>
         `;
       }).join("")}</div>`
     : "";
   const clipBusy = busyActionIds.has(clip.id);
-  const kindLabel = hasContent ? clip.kind : clip.attachments.length > 0 ? "文件" : "消息";
 
   return `
-    <article class="clip-card">
-      <div class="clip-meta">
-        <span class="chip">${kindLabel}</span>
-        <span>${escapeHtml(clip.sourcePlatform || "unknown")}</span>
-        <span>#${escapeHtml(shortenDeviceId(clip.sourceDeviceId))}</span>
-        <span>${escapeHtml(formatTimestamp(clip.createdAt))}</span>
-      </div>
-      ${contentHtml ? `<div class="clip-body">${contentHtml}</div>` : ""}
-      ${attachmentHtml}
-      <div class="clip-actions">
-        ${hasContent ? `<button class="button-secondary" data-action="copy-clip" data-id="${clip.id}" ${clipBusy ? "disabled" : ""}>复制到本机剪切板</button>` : ""}
-        <button class="button-secondary" data-action="${clip.isPinned ? "unpin-clip" : "pin-clip"}" data-id="${clip.id}" ${clipBusy ? "disabled" : ""}>${clip.isPinned ? "取消置顶" : "置顶"}</button>
-        <button class="button-danger" data-action="delete-clip" data-id="${clip.id}" ${clipBusy ? "disabled" : ""}>删除</button>
+    <article class="message-row${isMine ? " is-mine" : ""}">
+      ${isMine ? "" : `<div class="message-avatar">${escapeHtml((clip.sourcePlatform || "E").slice(0, 1).toUpperCase())}</div>`}
+      <div class="message-stack">
+        <div class="clip-meta">
+          <span>${escapeHtml(clip.sourcePlatform || "设备")}</span>
+          <span>${escapeHtml(formatTimestamp(clip.createdAt))}</span>
+          ${clip.isPinned ? `<i class="ph ph-star" aria-label="已收藏"></i>` : ""}
+        </div>
+        <div class="clip-card">
+          ${contentHtml ? `<div class="clip-body">${contentHtml}</div>` : ""}
+          ${attachmentHtml}
+        </div>
+        <div class="clip-actions">
+          ${hasContent ? `<button class="message-action" data-tooltip="复制" aria-label="复制" data-action="copy-clip" data-id="${clip.id}" ${clipBusy ? "disabled" : ""}><i class="ph ph-copy"></i></button>` : ""}
+          <button class="message-action" data-tooltip="${clip.isPinned ? "取消收藏" : "收藏"}" aria-label="${clip.isPinned ? "取消收藏" : "收藏"}" data-action="${clip.isPinned ? "unpin-clip" : "pin-clip"}" data-id="${clip.id}" ${clipBusy ? "disabled" : ""}><i class="ph ph-star"></i></button>
+          <button class="message-action danger" data-tooltip="删除" aria-label="删除" data-action="delete-clip" data-id="${clip.id}" ${clipBusy ? "disabled" : ""}><i class="ph ph-trash"></i></button>
+        </div>
       </div>
     </article>
   `;
@@ -482,53 +535,70 @@ function renderClipList(items: ClipRecord[], emptyText: string) {
     return `<div class="empty-card">${escapeHtml(emptyText)}</div>`;
   }
 
-  return `<div class="list">${items.map((item) => renderClipCard(item)).join("")}</div>`;
+  return `<div class="message-list">${items.map((item) => renderClipCard(item)).join("")}</div>`;
 }
 
 function renderLoginView() {
   return `
-    <div class="shell">
-      <div class="frame">
-        <section class="hero">
-          <p class="eyebrow">Echo Desktop</p>
-          <div class="title-row">
-            <div>
-              <h1>让剪切板常驻在线</h1>
-              <p class="hero-subtitle">桌面端检测到新的剪切板内容后会先询问，确认后才同步到你的私人 Echo。</p>
-            </div>
-            <span class="status-pill neutral">未登录</span>
-          </div>
-        </section>
+    <main class="login-shell">
+      <section class="login-card">
+        <div class="login-heading">
+          <div class="brand-mark">E</div>
+          <div><h1>登录 Echo</h1><p>连接手机、Windows 和 Mac</p></div>
+        </div>
+        <form id="login-form" class="login-form">
+          <label for="email">邮箱</label>
+          <input id="email" name="email" type="email" value="${escapeHtml(authDraft.email)}" autocomplete="email" required />
+          <label for="password">密码</label>
+          <input id="password" name="password" type="password" value="${escapeHtml(authDraft.password)}" autocomplete="current-password" required />
+          <button class="login-button" type="submit">登录</button>
+        </form>
+        <p class="login-status ${statusBanner.tone}">${escapeHtml(statusBanner.message)}</p>
+      </section>
+    </main>
+  `;
+}
 
-        <section class="status-banner ${statusBanner.tone}">${escapeHtml(statusBanner.message)}</section>
+function renderOrbView() {
+  const stateLabel = statusBanner.tone === "danger"
+    ? "需要处理"
+    : persistedState.pendingQueue.length > 0
+      ? `${persistedState.pendingQueue.length} 条待发送`
+      : "双击打开 Echo";
+  return `
+    <main class="orb-shell" data-tauri-drag-region>
+      <button class="echo-orb ${statusBanner.tone}${animateOrbEntry ? " enter" : ""}" type="button" data-action="expand-window" aria-label="${escapeHtml(stateLabel)}" data-tooltip="${escapeHtml(stateLabel)}" data-tauri-drag-region>
+        <span>E</span>
+        ${statusBanner.tone === "danger" || persistedState.pendingQueue.length > 0 ? `<i class="orb-alert"></i>` : ""}
+      </button>
+    </main>
+  `;
+}
 
-        <section class="panel">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">Login</p>
-              <div class="title-row">
-                <div>
-                  <h2>使用同一个 Supabase 账号登录</h2>
-                  <p class="panel-subtitle">桌面端和 Web 端共享同一条 Echo 私有数据流，RLS 会按用户隔离。</p>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <form id="login-form" class="stack auth-grid">
-            <div class="field">
-              <label for="email">邮箱</label>
-              <input id="email" name="email" type="email" value="${escapeHtml(authDraft.email)}" placeholder="you@example.com" autocomplete="email" required />
-            </div>
-            <div class="field">
-              <label for="password">密码</label>
-              <input id="password" name="password" type="password" value="${escapeHtml(authDraft.password)}" placeholder="请输入密码" autocomplete="current-password" required />
-            </div>
-            <button class="button" type="submit">登录并开始同步</button>
-          </form>
-        </section>
+function renderSettingsPanel() {
+  if (!settingsOpen) return "";
+  return `
+    <aside class="settings-popover" aria-label="Echo 设置">
+      <div class="settings-account">
+        <strong>${escapeHtml(currentSession?.user.email ?? "未登录")}</strong>
+        <small>${escapeHtml(detectPlatform())} 桌面端</small>
       </div>
-    </div>
+      <button class="menu-action" data-action="send-current-clipboard"><i class="ph ph-clipboard-text"></i><span>发送当前剪切板</span></button>
+      <button class="menu-action" data-action="flush-queue"><i class="ph ph-arrow-clockwise"></i><span>重试离线队列</span><small>${persistedState.pendingQueue.length}</small></button>
+      <label class="menu-toggle">
+        <span><i class="ph ph-eye"></i>监听剪切板</span>
+        <input id="monitor-toggle" type="checkbox" ${persistedState.settings.monitorClipboard ? "checked" : ""} />
+      </label>
+      <label class="menu-toggle">
+        <span><i class="ph ph-circle-dashed"></i>悬浮球模式</span>
+        <input id="floating-ball-toggle" type="checkbox" ${persistedState.settings.floatingBallEnabled ? "checked" : ""} />
+      </label>
+      <label class="menu-toggle">
+        <span><i class="ph ph-power"></i>开机自启</span>
+        <input id="autostart-toggle" type="checkbox" ${persistedState.settings.autostartEnabled ? "checked" : ""} />
+      </label>
+      <button class="menu-action danger" data-action="sign-out"><i class="ph ph-sign-out"></i><span>退出当前账号</span></button>
+    </aside>
   `;
 }
 
@@ -541,124 +611,79 @@ function renderAppView() {
             <strong>${escapeHtml(attachmentName(attachment))}</strong>
             <small>${escapeHtml(formatFileSize(attachmentSize(attachment)))}</small>
           </span>
-          <button class="remove-attachment" type="button" data-action="remove-pending-attachment" data-index="${index}" aria-label="移除 ${escapeHtml(attachmentName(attachment))}">×</button>
+          <button class="remove-attachment" type="button" data-action="remove-pending-attachment" data-index="${index}" aria-label="移除 ${escapeHtml(attachmentName(attachment))}" data-tooltip="移除"><i class="ph ph-x"></i></button>
         </div>
       `).join("")}</div>`
     : "";
+  const conversation = [...pinnedClips, ...recentClips]
+    .sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime());
+  const statusLabel = statusBanner.tone === "success"
+    ? "已同步"
+    : statusBanner.tone === "warning"
+      ? "等待处理"
+      : statusBanner.tone === "danger"
+        ? "同步异常"
+        : "在线";
+
   return `
-    <div class="shell">
-      <div class="frame">
-        <section class="hero">
-          <p class="eyebrow">Echo Desktop</p>
-          <div class="title-row">
-            <div>
-              <h1>托盘常驻的小面板</h1>
-              <p class="hero-subtitle">复制代码以后它会自动同步，另一台设备收到通知后点一下就能写回本机剪切板。</p>
-            </div>
-            <span class="status-pill ${statusBanner.tone}">${escapeHtml(statusBanner.tone === "success" ? "在线" : statusBanner.tone === "warning" ? "离线队列" : statusBanner.tone === "danger" ? "异常" : "待命")}</span>
+    <main class="chat-shell${dragActive ? " is-dragging" : ""}${animateWindowEntry ? " enter" : ""}">
+      <header class="chat-header" data-tauri-drag-region>
+        <div class="chat-identity" data-tauri-drag-region>
+          <div class="brand-mark">E</div>
+          <div>
+            <h1>文件传输助手</h1>
+            <p><i class="connection-dot ${statusBanner.tone}"></i>${escapeHtml(statusLabel)}</p>
           </div>
-          <div class="meta-grid">
-            <div class="meta-card">
-              <strong>账号</strong>
-              <span>${escapeHtml(currentSession?.user.email ?? "未登录")}</span>
-            </div>
-            <div class="meta-card">
-              <strong>设备 ID</strong>
-              <span class="mono">${escapeHtml(shortenDeviceId(persistedState.deviceId))}</span>
-            </div>
-            <div class="meta-card">
-              <strong>待发送队列</strong>
-              <span>${persistedState.pendingQueue.length} 条</span>
-            </div>
-            <div class="meta-card">
-              <strong>最近同步</strong>
-              <span>${escapeHtml(persistedState.settings.lastSeenTimestamp ? formatTimestamp(persistedState.settings.lastSeenTimestamp) : "暂无")}</span>
-            </div>
-          </div>
-          <div class="action-row">
-            <button class="button" data-action="send-current-clipboard">发送当前剪切板</button>
-            <button class="button-secondary" data-action="choose-files">发送文件</button>
-            <button class="button-secondary" data-action="flush-queue">重试离线队列</button>
-            <button class="button-secondary" data-action="refresh-clips">刷新列表</button>
-            <button class="button-danger" data-action="sign-out">退出当前设备登录</button>
-          </div>
-          ${pendingClipboard ? `<div class="status-banner warning"><strong>发送刚复制的内容？</strong><p>${escapeHtml(pendingClipboard.content.slice(0, 120))}</p><div class="action-row"><button class="button" data-action="confirm-clipboard">发送</button><button class="button-secondary" data-action="ignore-clipboard">忽略</button></div></div>` : ""}
-          <div class="toggle-row">
-            <label class="toggle">
-              <input id="monitor-toggle" type="checkbox" ${persistedState.settings.monitorClipboard ? "checked" : ""} />
-              检测剪切板并询问
-            </label>
-            <label class="toggle">
-              <input id="autostart-toggle" type="checkbox" ${persistedState.settings.autostartEnabled ? "checked" : ""} />
-              开机自启
-            </label>
-          </div>
-        </section>
+        </div>
+        <div class="header-actions">
+          <button class="icon-button" type="button" data-action="refresh-clips" aria-label="刷新" data-tooltip="刷新"><i class="ph ph-arrow-clockwise"></i></button>
+          <button class="icon-button" type="button" data-action="toggle-settings" aria-label="设置" data-tooltip="设置"><i class="ph ph-dots-three"></i></button>
+          <button class="icon-button" type="button" data-action="collapse-window" aria-label="收起为悬浮球" data-tooltip="收起"><i class="ph ph-minus"></i></button>
+        </div>
+        ${renderSettingsPanel()}
+      </header>
 
-        <section class="panel composer-panel">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">Send</p>
-              <div class="title-row">
-                <div>
-                  <h2>发送到其他设备</h2>
-                  <p class="panel-subtitle">直接输入消息，或选择图片和文件。发送后手机、Windows 和 Mac 会同步收到。</p>
-                </div>
-              </div>
-            </div>
+      <section class="conversation" aria-label="消息记录">
+        ${pendingClipboard ? `
+          <div class="clipboard-confirm">
+            <div><strong>发送刚复制的内容？</strong><p>${escapeHtml(pendingClipboard.content.slice(0, 120))}</p></div>
+            <div><button class="button" data-action="confirm-clipboard">发送</button><button class="button-secondary" data-action="ignore-clipboard">忽略</button></div>
           </div>
-          <form id="message-form" class="message-composer">
-            <label class="sr-only" for="message-input">消息内容</label>
-            <textarea id="message-input" name="message" rows="4" placeholder="输入消息，或在这里粘贴图片和文件…">${escapeHtml(messageDraft)}</textarea>
-            ${pendingAttachmentsHtml}
-            <div class="composer-actions">
-              <button class="button-secondary" type="button" data-action="choose-files">选择图片或文件</button>
-              <button class="button" type="submit" ${messageSending ? "disabled" : ""}>${messageSending ? "正在发送…" : "发送消息"}</button>
-            </div>
-          </form>
-          <input id="desktop-file-input" type="file" multiple hidden />
-        </section>
+        ` : ""}
+        ${renderClipList(conversation, "把文字、图片或文件拖到下方发送区，Echo 会同步到你的所有设备。")}
+      </section>
 
-        <section class="status-banner ${statusBanner.tone}">${escapeHtml(statusBanner.message)}</section>
-
-        <section class="panel">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">Pinned</p>
-              <div class="title-row">
-                <div>
-                  <h2>长期保留区</h2>
-                  <p class="panel-subtitle">适合固定命令、常用代码和跨设备反复要用的片段。</p>
-                </div>
-              </div>
+      <footer class="composer-dock">
+        <div class="compact-status ${statusBanner.tone}">${escapeHtml(statusBanner.message)}</div>
+        <form id="message-form" class="message-composer">
+          ${dragActive ? `<div class="drop-overlay"><i class="ph ph-download-simple"></i><strong>松开即可加入发送</strong><span>支持多个文件，单个最大 500MB</span></div>` : ""}
+          ${pendingAttachmentsHtml}
+          <label class="sr-only" for="message-input">消息内容</label>
+          <textarea id="message-input" name="message" rows="2" placeholder="输入消息，粘贴或拖入文件">${escapeHtml(messageDraft)}</textarea>
+          <div class="composer-actions">
+            <div class="composer-tools">
+              <button class="icon-button" type="button" data-action="choose-files" aria-label="选择文件" data-tooltip="选择文件"><i class="ph ph-paperclip"></i></button>
+              <button class="icon-button" type="button" data-action="send-current-clipboard" aria-label="发送当前剪切板" data-tooltip="发送剪切板"><i class="ph ph-scissors"></i></button>
             </div>
-            <span class="counter">${pinnedClips.length} 条</span>
+            <button class="send-button" type="submit" ${messageSending || (!messageDraft.trim() && pendingComposerAttachments.length === 0) ? "disabled" : ""} aria-label="发送" data-tooltip="发送">
+              <i class="ph ${messageSending ? "ph-circle-notch" : "ph-paper-plane-tilt"}"></i>
+            </button>
           </div>
-          ${renderClipList(pinnedClips, "还没有置顶内容。等你把常用片段在任一设备上置顶后，这里会长期保留。")}
-        </section>
-
-        <section class="panel">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">Recent</p>
-              <div class="title-row">
-                <div>
-                  <h2>最近 100 条</h2>
-                  <p class="panel-subtitle">这里保留临时接力用的最近记录，不会自动覆盖你的当前剪切板。</p>
-                </div>
-              </div>
-            </div>
-            <span class="counter">${recentClips.length} 条</span>
-          </div>
-          ${renderClipList(recentClips, "最近还没有同步记录。复制一段文本或代码，确认后就会进入 Echo。")}
-        </section>
-      </div>
-    </div>
+        </form>
+        <input id="desktop-file-input" type="file" multiple hidden />
+      </footer>
+    </main>
   `;
 }
 
 function render() {
-  root.innerHTML = currentSession ? renderAppView() : renderLoginView();
+  root.innerHTML = compactMode ? renderOrbView() : currentSession ? renderAppView() : renderLoginView();
+  if (!compactMode && currentSession && stickConversationToBottom) {
+    window.requestAnimationFrame(() => {
+      const conversation = root.querySelector<HTMLElement>(".conversation");
+      if (conversation) conversation.scrollTop = conversation.scrollHeight;
+    });
+  }
 }
 
 async function syncTrayTooltip() {
@@ -721,6 +746,74 @@ async function notifyNewClip(clip: ClipRecord) {
   });
 }
 
+function clearIdleCollapseTimer() {
+  if (idleCollapseTimer) {
+    window.clearTimeout(idleCollapseTimer);
+    idleCollapseTimer = null;
+  }
+}
+
+function scheduleIdleCollapse() {
+  clearIdleCollapseTimer();
+  if (!currentSession || compactMode || !persistedState.settings.floatingBallEnabled) return;
+  idleCollapseTimer = window.setTimeout(() => {
+    if (messageSending) {
+      scheduleIdleCollapse();
+      return;
+    }
+    void collapseToOrb();
+  }, 2 * 60 * 1000);
+}
+
+async function collapseToOrb() {
+  settingsOpen = false;
+  clearIdleCollapseTimer();
+
+  const windowRef = getCurrentWindow();
+
+  if (!persistedState.settings.floatingBallEnabled) {
+    await windowRef.hide();
+    return;
+  }
+
+  compactMode = true;
+  dragActive = false;
+  animateOrbEntry = true;
+  render();
+  animateOrbEntry = false;
+  await windowRef.setMinSize(new LogicalSize(56, 56));
+  await windowRef.setResizable(false);
+  await windowRef.setDecorations(false);
+  await Promise.allSettled([
+    windowRef.setShadow(false),
+    windowRef.setAlwaysOnTop(true),
+    windowRef.setSkipTaskbar(true),
+  ]);
+  await windowRef.setSize(new LogicalSize(64, 64));
+  await windowRef.show();
+}
+
+async function expandFromOrb() {
+  const windowRef = getCurrentWindow();
+  compactMode = false;
+  animateWindowEntry = true;
+  render();
+  animateWindowEntry = false;
+  await windowRef.setSize(new LogicalSize(460, 720));
+  await windowRef.setMinSize(new LogicalSize(380, 600));
+  await windowRef.setResizable(true);
+  await windowRef.setDecorations(false);
+  await Promise.allSettled([
+    windowRef.setShadow(true),
+    windowRef.setAlwaysOnTop(false),
+    windowRef.setSkipTaskbar(false),
+  ]);
+  await windowRef.center();
+  await windowRef.show();
+  await windowRef.setFocus();
+  scheduleIdleCollapse();
+}
+
 async function setupWindowChrome() {
   const windowRef = getCurrentWindow();
 
@@ -730,8 +823,7 @@ async function setupWindowChrome() {
     }
 
     event.preventDefault();
-    await windowRef.hide();
-    setStatus("neutral", "面板已隐藏，托盘仍在后台监听剪切板。");
+    await collapseToOrb();
   });
 }
 
@@ -740,10 +832,31 @@ async function toggleWindow() {
   const visible = await windowRef.isVisible();
 
   if (visible) {
-    await windowRef.hide();
+    if (compactMode) await expandFromOrb();
+    else await collapseToOrb();
   } else {
-    await windowRef.show();
+    await expandFromOrb();
   }
+}
+
+async function setupFileDrop() {
+  await getCurrentWebview().onDragDropEvent((event) => {
+    if (!currentSession || compactMode) return;
+    if (event.payload.type === "enter" || event.payload.type === "over") {
+      setDragActive(true);
+      scheduleIdleCollapse();
+      return;
+    }
+    if (event.payload.type === "drop") {
+      setDragActive(false);
+      scheduleIdleCollapse();
+      void queueDroppedPaths(event.payload.paths);
+      return;
+    }
+    if (dragActive) {
+      setDragActive(false);
+    }
+  });
 }
 
 async function quitApplication() {
@@ -756,7 +869,7 @@ async function setupTray() {
     items: [
       {
         id: "toggle",
-        text: "显示 / 隐藏面板",
+        text: "展开 / 收起悬浮球",
         action: () => {
           void toggleWindow();
         },
@@ -969,6 +1082,7 @@ async function handleSignedIn() {
   await subscribeToRealtime();
   await flushPendingQueue();
   setStatus("success", "桌面端已接入你的 Echo 数据流。");
+  scheduleIdleCollapse();
 }
 
 async function setupAuth() {
@@ -1268,6 +1382,7 @@ async function sendComposerMessage(content: string) {
     }
     messageDraft = "";
     pendingComposerAttachments = [];
+    stickConversationToBottom = true;
     await Promise.allSettled(attachments.filter((file): file is NativeClipboardFile => file.kind === "native").map((file) => invoke("release_clipboard_file", { id: file.id })));
     setStatus("success", `${attachments.length} 个附件已发送到 Echo。`);
     await refreshClips(true);
@@ -1428,10 +1543,67 @@ async function handleToggleChange(input: HTMLInputElement) {
     await syncAutostartPreference();
     await saveAndRender();
     setStatus("neutral", input.checked ? "开机自启已开启。" : "开机自启已关闭。");
+    return;
+  }
+
+  if (input.id === "floating-ball-toggle") {
+    persistedState.settings.floatingBallEnabled = input.checked;
+    await saveAndRender();
+    if (input.checked) {
+      setStatus("neutral", "悬浮球模式已开启，空闲 2 分钟后自动收起。");
+      scheduleIdleCollapse();
+    } else {
+      clearIdleCollapseTimer();
+      setStatus("neutral", "悬浮球模式已关闭，收起时会隐藏到托盘。");
+    }
   }
 }
 
 function attachDomEvents() {
+  root.addEventListener("scroll", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || !target.classList.contains("conversation")) return;
+    stickConversationToBottom = target.scrollHeight - target.scrollTop - target.clientHeight < 72;
+  }, true);
+
+  root.addEventListener("dragenter", (event) => {
+    if (!currentSession || compactMode || !event.dataTransfer?.types.includes("Files")) return;
+    event.preventDefault();
+    browserDragDepth += 1;
+    setDragActive(true);
+    scheduleIdleCollapse();
+  });
+
+  root.addEventListener("dragover", (event) => {
+    if (!currentSession || compactMode || !event.dataTransfer?.types.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  });
+
+  root.addEventListener("dragleave", (event) => {
+    if (!event.dataTransfer?.types.includes("Files")) return;
+    browserDragDepth = Math.max(0, browserDragDepth - 1);
+    if (browserDragDepth === 0 && dragActive) {
+      setDragActive(false);
+    }
+  });
+
+  root.addEventListener("drop", (event) => {
+    if (!currentSession || compactMode) return;
+    event.preventDefault();
+    browserDragDepth = 0;
+    setDragActive(false);
+    const files = event.dataTransfer ? clipboardFilesFromDataTransfer(event.dataTransfer) : [];
+    if (files.length > 0) queueComposerBrowserFiles(files);
+    else render();
+    scheduleIdleCollapse();
+  });
+
+  root.addEventListener("dblclick", (event) => {
+    const target = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-action='expand-window']");
+    if (target) void expandFromOrb();
+  });
+
   root.addEventListener("paste", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLTextAreaElement) || target.id !== "message-input") return;
@@ -1447,6 +1619,7 @@ function attachDomEvents() {
   });
 
   root.addEventListener("input", (event) => {
+    scheduleIdleCollapse();
     const target = event.target;
     if (target instanceof HTMLTextAreaElement && target.id === "message-input") {
       messageDraft = target.value;
@@ -1478,7 +1651,7 @@ function attachDomEvents() {
       return;
     }
 
-    if (target.id === "monitor-toggle" || target.id === "autostart-toggle") {
+    if (target.id === "monitor-toggle" || target.id === "autostart-toggle" || target.id === "floating-ball-toggle") {
       void handleToggleChange(target);
     }
   });
@@ -1503,6 +1676,7 @@ function attachDomEvents() {
   });
 
   root.addEventListener("click", (event) => {
+    scheduleIdleCollapse();
     const actionTarget = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-action]");
     if (!actionTarget) {
       return;
@@ -1591,6 +1765,17 @@ function attachDomEvents() {
       return;
     }
 
+    if (action === "toggle-settings") {
+      settingsOpen = !settingsOpen;
+      render();
+      return;
+    }
+
+    if (action === "collapse-window") {
+      void collapseToOrb();
+      return;
+    }
+
     if (action === "sign-out") {
       void signOutLocal().catch((error) => {
         setStatus("danger", getErrorMessage(error, "退出当前设备登录失败。"));
@@ -1623,6 +1808,7 @@ async function bootstrap() {
   await ensureStore();
   await syncAutostartPreference();
   await setupWindowChrome();
+  await setupFileDrop();
   await setupTray();
   await ensureNotificationPermission();
   startClipboardWatcher();
@@ -1644,6 +1830,11 @@ async function bootstrap() {
   });
 
   await setupAuth();
+  if (currentSession && persistedState.settings.floatingBallEnabled) {
+    await collapseToOrb();
+  } else {
+    scheduleIdleCollapse();
+  }
 }
 
 void bootstrap();

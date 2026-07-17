@@ -104,9 +104,11 @@ export function EchoProductApp() {
   const [error, setError] = useState<string | null>(supabaseConfigError);
   const [notice, setNotice] = useState<string | null>(null);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadAbortRef = useRef<AbortController | null>(null);
   const analyzingRef = useRef(new Set<string>());
+  const dragDepthRef = useRef(0);
 
   const loadData = useCallback(async (currentSession: Session, loading = false) => {
     const supabase = getSupabaseClient();
@@ -197,6 +199,26 @@ export function EchoProductApp() {
     if (files.length === 0) return;
     event.preventDefault();
     addFiles(files);
+  }
+
+  function handleComposerDragEnter(event: React.DragEvent<HTMLElement>) {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setIsDraggingFiles(true);
+  }
+
+  function handleComposerDragLeave(event: React.DragEvent<HTMLElement>) {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setIsDraggingFiles(false);
+  }
+
+  function handleComposerDrop(event: React.DragEvent<HTMLElement>) {
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+    addFiles(filesFromClipboard(event.dataTransfer));
   }
 
   async function analyzeNote(noteId: string, attachmentIds: string[]) {
@@ -290,7 +312,7 @@ export function EchoProductApp() {
     <main className="flex h-[100dvh] flex-col overflow-hidden bg-[var(--canvas)]">
       <div className="mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col border-x border-[var(--line)] bg-[var(--surface)]">
         <header className="shrink-0 border-b border-[var(--line)] px-4 pt-[max(1rem,env(safe-area-inset-top))] pb-3 sm:px-6">
-          <div className="flex items-center gap-3"><div className="echo-mark">E</div><div className="min-w-0 flex-1"><h1 className="text-sm font-semibold">Echo</h1><p className="text-xs text-[var(--muted)]">{session.user.email}</p></div><button className="relative icon-button" onClick={() => setShowAi(true)} aria-label="打开 Echo AI"><Sparkles size={17} />{suggestions.length ? <span className="absolute -right-1 -top-1 grid min-h-4 min-w-4 place-items-center rounded-full bg-[var(--accent)] px-1 text-[9px] text-white">{suggestions.length}</span> : null}</button><button className="icon-button" onClick={() => void getSupabaseClient()?.auth.signOut({ scope: "local" })} aria-label="退出登录"><LogOut size={17} /></button></div>
+          <div className="flex items-center gap-3"><div className="echo-mark">E</div><div className="min-w-0 flex-1"><h1 className="text-sm font-semibold">Echo</h1><p className="text-xs text-[var(--muted)]">{session.user.email}</p></div><button className="relative icon-button" data-tooltip="打开 Echo AI" onClick={() => setShowAi(true)} aria-label="打开 Echo AI"><Sparkles size={17} />{suggestions.length ? <span className="absolute -right-1 -top-1 grid min-h-4 min-w-4 place-items-center rounded-full bg-[var(--accent)] px-1 text-[9px] text-white">{suggestions.length}</span> : null}</button><button className="icon-button" data-tooltip="退出登录" onClick={() => void getSupabaseClient()?.auth.signOut({ scope: "local" })} aria-label="退出登录"><LogOut size={17} /></button></div>
           <div className="mt-4 flex items-center gap-2 overflow-x-auto">{([{ id: "inbox", label: "收件箱", icon: Inbox }, { id: "starred", label: "收藏", icon: Star }, { id: "archived", label: "归档", icon: Archive }] as const).map(({ id, label, icon: Icon }) => <button key={id} className={`view-tab ${view === id ? "view-tab-active" : ""}`} onClick={() => setView(id)}><Icon size={15} />{label}</button>)}<select className="ml-auto rounded-lg border border-[var(--line)] bg-[var(--surface-raised)] px-2 py-2 text-xs" value={activeFolder} onChange={(event) => setActiveFolder(event.target.value)}><option value="all">全部文件夹</option>{folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}</select></div>
           <input className="mt-3 w-full rounded-xl border border-[var(--line)] bg-[var(--surface-raised)] px-3 py-2.5 text-sm outline-none focus:border-[var(--accent)]" type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索正文、文件名、标签和摘要" />
         </header>
@@ -307,10 +329,11 @@ export function EchoProductApp() {
           ))}</div>}
         </section>
 
-        <footer className="shrink-0 border-t border-[var(--line)] bg-[var(--surface)] px-3 pt-3 pb-[max(.75rem,env(safe-area-inset-bottom))] sm:px-5">
+        <footer className={`relative shrink-0 border-t bg-[var(--surface)] px-3 pt-3 pb-[max(.75rem,env(safe-area-inset-bottom))] transition-colors sm:px-5 ${isDraggingFiles ? "border-[var(--accent)]" : "border-[var(--line)]"}`} onDragEnter={handleComposerDragEnter} onDragOver={(event) => { if (event.dataTransfer.types.includes("Files")) { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; } }} onDragLeave={handleComposerDragLeave} onDrop={handleComposerDrop}>
+          {isDraggingFiles ? <div className="pointer-events-none absolute inset-2 z-10 grid place-items-center rounded-xl border-2 border-dashed border-[var(--accent)] bg-[color-mix(in_srgb,var(--surface)_94%,transparent)] text-center"><div><FileIcon className="mx-auto text-[var(--accent)]" size={24} /><p className="mt-2 text-sm font-semibold">松开即可加入发送</p><p className="mt-1 text-xs text-[var(--muted)]">可同时拖入多个文件</p></div></div> : null}
           {pendingFiles.length ? <div className="mb-2 flex gap-2 overflow-x-auto">{pendingFiles.map((file, index) => <div key={`${file.name}-${index}`} className="flex max-w-56 shrink-0 items-center gap-2 rounded-lg bg-[var(--surface-muted)] px-2.5 py-2 text-xs"><span className="truncate">{file.name}</span><button onClick={() => setPendingFiles((current) => current.filter((_, currentIndex) => currentIndex !== index))}><X size={13} /></button></div>)}</div> : null}
           {uploads.length ? <div className="mb-2 space-y-1">{uploads.map((upload) => <div key={upload.name}><div className="flex justify-between text-[10px] text-[var(--muted)]"><span className="truncate">{upload.name}</span><span>{upload.percent}%</span></div><div className="mt-1 h-1 overflow-hidden rounded-full bg-[var(--surface-muted)]"><div className="h-full bg-[var(--accent)]" style={{ width: `${upload.percent}%` }} /></div></div>)}</div> : null}
-          <div className="flex items-end gap-2"><input ref={fileInputRef} className="hidden" type="file" multiple onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} /><button className="icon-button shrink-0" onClick={() => fileInputRef.current?.click()} aria-label="添加文件"><Paperclip size={18} /></button><textarea className="max-h-36 min-h-10 flex-1 resize-none rounded-xl border border-[var(--line)] bg-[var(--surface-raised)] px-3 py-2.5 text-sm outline-none focus:border-[var(--accent)]" rows={1} value={input} onChange={(event) => setInput(event.target.value)} onPaste={handleComposerPaste} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder="输入消息，或粘贴图片和文件…" />{isSending ? <button className="icon-button shrink-0" onClick={() => uploadAbortRef.current?.abort()} aria-label="取消发送"><X size={18} /></button> : <button className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-[var(--ink)] text-[var(--surface)] disabled:opacity-40" onClick={() => void send()} disabled={!input.trim() && pendingFiles.length === 0} aria-label="发送"><Send size={17} /></button>}</div>
+          <div className="flex items-end gap-2"><input ref={fileInputRef} className="hidden" type="file" multiple onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} /><button className="icon-button shrink-0" data-tooltip="添加文件" onClick={() => fileInputRef.current?.click()} aria-label="添加文件"><Paperclip size={18} /></button><textarea className="max-h-36 min-h-10 flex-1 resize-none rounded-xl border border-[var(--line)] bg-[var(--surface-raised)] px-3 py-2.5 text-sm outline-none transition-colors focus:border-[var(--accent)]" rows={1} value={input} onChange={(event) => setInput(event.target.value)} onPaste={handleComposerPaste} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder="输入消息，粘贴或拖入文件…" />{isSending ? <button className="icon-button shrink-0" data-tooltip="取消发送" onClick={() => uploadAbortRef.current?.abort()} aria-label="取消发送"><X size={18} /></button> : <button className="web-send-button grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-[var(--ink)] text-[var(--surface)] disabled:opacity-40" data-tooltip="发送" onClick={() => void send()} disabled={!input.trim() && pendingFiles.length === 0} aria-label="发送"><Send size={17} /></button>}</div>
         </footer>
       </div>
       {showAi ? <AiWorkspace accessToken={session.access_token} suggestions={suggestions} onClose={() => setShowAi(false)} onSuggestionHandled={() => loadData(session)} onOpenNote={openNote} /> : null}
