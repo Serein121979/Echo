@@ -65,13 +65,19 @@ pub fn run() {
     .expect("error while building Echo Desktop");
 
   app.run(|app_handle, event| {
-    if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
-      if !has_visible_windows {
-        if let Some(window) = app_handle.get_webview_window("main") {
-          let _ = window.show();
-          let _ = window.set_focus();
+    #[cfg(target_os = "macos")]
+    {
+      if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+        if !has_visible_windows {
+          if let Some(window) = app_handle.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+          }
         }
       }
     }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app_handle, event);
   });
 }
