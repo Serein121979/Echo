@@ -1,5 +1,5 @@
-import { ClipsApp } from "@/components/clips/ClipsApp";
+import { redirect } from "next/navigation";
 
 export default function ClipsPage() {
-  return <ClipsApp />;
+  redirect("/");
 }

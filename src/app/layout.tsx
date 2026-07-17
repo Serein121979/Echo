@@ -5,13 +5,16 @@ import { PwaServiceWorker } from "@/components/pwa/PwaServiceWorker";
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
-  maximumScale: 1,
-  userScalable: false,
+  viewportFit: "cover",
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#181c21" },
+  ],
 };
 
 export const metadata: Metadata = {
-  title: "Echo - 极简跨设备消息箱",
-  description: "一个黑白极简的跨设备消息同步与整理工具",
+  title: "Echo - 私人跨设备信息助手",
+  description: "跨设备传输、检索和整理私人信息",
   manifest: "/manifest.webmanifest",
   appleWebApp: {
     capable: true,

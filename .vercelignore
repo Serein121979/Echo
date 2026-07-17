@@ -1,0 +1,7 @@
+clips-desktop
+.git
+.next
+.playwright-cli
+output
+node_modules
+*.tsbuildinfo

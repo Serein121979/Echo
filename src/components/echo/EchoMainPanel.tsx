@@ -1,11 +1,14 @@
 import { EchoNoteCard } from "./EchoNoteCard";
 import type { FolderItem, Note } from "./types";
 import type { RefObject, UIEvent } from "react";
+import type { EchoView } from "./EchoHeader";
 
 type EchoMainPanelProps = {
   folders: FolderItem[];
   isLoading: boolean;
   filteredNotes: Note[];
+  view: EchoView;
+  searchQuery: string;
   noteActionId: string | null;
   editingNoteId: string | null;
   editingContent: string;
@@ -38,6 +41,8 @@ export function EchoMainPanel({
   folders,
   isLoading,
   filteredNotes,
+  view,
+  searchQuery,
   noteActionId,
   editingNoteId,
   editingContent,
@@ -68,15 +73,25 @@ export function EchoMainPanel({
   return (
     <section className="flex h-full min-h-0 flex-col overflow-hidden">
       <div className="min-h-0 flex-1 overflow-y-auto px-0 py-0" onScroll={onScroll}>
-        <div className="space-y-5 px-4 py-5 sm:px-6">
+        <div className="space-y-4 px-4 py-5 sm:px-6 sm:py-7">
           {isLoading ? (
-            <div className="py-16 text-center">
-              <div className="mx-auto h-8 w-8 animate-spin rounded-full border-2 border-neutral-300 border-t-neutral-950" />
-              <p className="mt-4 text-neutral-500">加载中...</p>
+            <div className="space-y-4 py-3" aria-label="正在加载">
+              {["72%", "48%", "63%"].map((width) => (
+                <div key={width} className="flex gap-3">
+                  <div className="h-9 w-9 shrink-0 animate-pulse rounded-xl bg-[var(--surface-muted)]" />
+                  <div className="h-20 animate-pulse rounded-2xl bg-[var(--surface-muted)]" style={{ width }} />
+                </div>
+              ))}
             </div>
           ) : filteredNotes.length === 0 ? (
-            <div className="py-16 text-center text-neutral-500">
-              这个视图里还没有消息，发一条试试看。
+            <div className="mx-auto flex max-w-sm flex-col items-center py-20 text-center">
+              <div className="echo-empty-mark" aria-hidden="true">E</div>
+              <h2 className="mt-5 text-base font-semibold text-[var(--ink)]">
+                {searchQuery ? "没有找到匹配内容" : view === "starred" ? "还没有收藏" : view === "archived" ? "归档还是空的" : "从第一条 Echo 开始"}
+              </h2>
+              <p className="mt-2 text-sm leading-6 text-[var(--muted)]">
+                {searchQuery ? "换个关键词试试，搜索会匹配正文、文件名和标签。" : view === "inbox" ? "粘贴一段文字、链接或文件，它会立即出现在你的其他设备。" : "你整理过的内容会出现在这里。"}
+              </p>
             </div>
           ) : (
             filteredNotes.map((note) => (

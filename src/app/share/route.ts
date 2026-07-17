@@ -1,124 +1,38 @@
 import { NextResponse } from "next/server";
-import { getSupabaseClient, supabaseConfigError } from "@/utils/supabase/client";
+import { requireUser } from "@/utils/supabase/server";
 
-const STORAGE_BUCKET = "echo-files";
+const MAX_FILE_SIZE = 500 * 1024 * 1024;
 
-function redirectHome(request: Request) {
-  return NextResponse.redirect(new URL("/", request.url), 303);
+function redirect(request: Request, state: "shared" | "signin" | "error") {
+  return NextResponse.redirect(new URL(`/?share=${state}`, request.url), 303);
 }
 
-function getString(value: FormDataEntryValue | null) {
+function stringValue(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
-}
-
-function getShareContent(title: string, text: string, url: string) {
-  const parts = [text, url].filter(Boolean);
-
-  if (parts.length > 0) {
-    return parts.join("\n");
-  }
-
-  return title;
-}
-
-function getFileExtension(fileName: string) {
-  const dotIndex = fileName.lastIndexOf(".");
-  if (dotIndex < 0 || dotIndex === fileName.length - 1) {
-    return "";
-  }
-
-  return fileName.slice(dotIndex);
-}
-
-function collectSharedFiles(formData: FormData) {
-  const entries = [...formData.getAll("file"), ...formData.getAll("files")];
-  return entries.filter((entry): entry is File => entry instanceof File && entry.size > 0);
-}
-
-async function uploadSharedFile(file: File) {
-  const supabase = getSupabaseClient();
-
-  if (!supabase) {
-    throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
-  }
-
-  const path = `${new Date().toISOString().slice(0, 10)}/${crypto.randomUUID()}${getFileExtension(file.name)}`;
-  const { error: uploadError } = await supabase.storage.from(STORAGE_BUCKET).upload(path, file, {
-    cacheControl: "3600",
-    contentType: file.type || undefined,
-    upsert: false,
-  });
-
-  if (uploadError) {
-    throw uploadError;
-  }
-
-  const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(path);
-
-  return {
-    file_path: path,
-    file_url: data.publicUrl,
-    file_name: file.name,
-    file_type: file.type || "application/octet-stream",
-    file_size: file.size,
-  };
-}
-
-async function insertSharedNote(payload: {
-  content: string;
-  file_path?: string;
-  file_url?: string;
-  file_name?: string;
-  file_type?: string;
-  file_size?: number;
-}) {
-  const supabase = getSupabaseClient();
-
-  if (!supabase) {
-    throw new Error(supabaseConfigError ?? "Supabase 客户端初始化失败");
-  }
-
-  const { error } = await supabase.from("notes").insert([
-    {
-      content: payload.content,
-      folder_id: null,
-      ...(payload.file_path ? { file_path: payload.file_path } : {}),
-      ...(payload.file_url ? { file_url: payload.file_url } : {}),
-      ...(payload.file_name ? { file_name: payload.file_name } : {}),
-      ...(payload.file_type ? { file_type: payload.file_type } : {}),
-      ...(typeof payload.file_size === "number" ? { file_size: payload.file_size } : {}),
-    },
-  ]);
-
-  if (error) {
-    throw error;
-  }
 }
 
 export async function POST(request: Request) {
   try {
-    const formData = await request.formData();
-    const title = getString(formData.get("title"));
-    const text = getString(formData.get("text"));
-    const url = getString(formData.get("url"));
-    const sharedFiles = collectSharedFiles(formData);
-    const content = getShareContent(title, text, url);
+    const { supabase, user } = await requireUser(request);
+    const form = await request.formData();
+    const content = [stringValue(form.get("title")), stringValue(form.get("text")), stringValue(form.get("url"))].filter(Boolean).join("\n");
+    const files = [...form.getAll("file"), ...form.getAll("files")].filter((item): item is File => item instanceof File && item.size > 0);
+    if (!content && files.length === 0) return redirect(request, "error");
+    if (files.some((file) => file.size > MAX_FILE_SIZE)) return redirect(request, "error");
 
-    if (sharedFiles.length === 0) {
-      await insertSharedNote({ content });
-      return redirectHome(request);
+    const { data: note, error: noteError } = await supabase.from("notes").insert({ user_id: user.id, content, source_platform: "share-target" }).select("id").single();
+    if (noteError) throw noteError;
+    for (const file of files) {
+      const suffix = file.name.includes(".") ? `.${file.name.split(".").pop()}` : "";
+      const path = `${user.id}/${new Date().toISOString().slice(0, 10)}/${crypto.randomUUID()}${suffix}`;
+      const { error: uploadError } = await supabase.storage.from("echo-files").upload(path, file, { contentType: file.type || "application/octet-stream", upsert: false });
+      if (uploadError) throw uploadError;
+      const { error: attachmentError } = await supabase.from("attachments").insert({ user_id: user.id, note_id: note.id, storage_path: path, file_name: file.name, file_type: file.type || "application/octet-stream", file_size: file.size });
+      if (attachmentError) throw attachmentError;
     }
-
-    for (const file of sharedFiles) {
-      const attachment = await uploadSharedFile(file);
-      await insertSharedNote({
-        content,
-        ...attachment,
-      });
-    }
+    return redirect(request, "shared");
   } catch (error) {
     console.error("POST /share failed", error);
+    return redirect(request, error instanceof Error && error.message === "UNAUTHORIZED" ? "signin" : "error");
   }
-
-  return redirectHome(request);
 }

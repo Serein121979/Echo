@@ -5,6 +5,7 @@ import { getSupabaseClient } from "@/utils/supabase/client";
 import { EchoComposer } from "@/components/echo/EchoComposer";
 import { EchoMainPanel } from "@/components/echo/EchoMainPanel";
 import { EchoSidebar } from "@/components/echo/EchoSidebar";
+import { EchoHeader, type EchoView } from "@/components/echo/EchoHeader";
 import { createEchoActions } from "@/components/echo/echoActions";
 import type {
   AutoTagMatchType,
@@ -40,6 +41,8 @@ export function EchoApp() {
   const [autoTagRules, setAutoTagRules] = useState<AutoTagRule[]>([]);
   const [activeFolderId, setActiveFolderId] = useState("all");
   const [activeTagId, setActiveTagId] = useState("all");
+  const [activeView, setActiveView] = useState<EchoView>("inbox");
+  const [searchQuery, setSearchQuery] = useState("");
   const [selectedFolderId, setSelectedFolderId] = useState("");
   const [newFolderName, setNewFolderName] = useState("");
   const [newTagName, setNewTagName] = useState("");
@@ -364,14 +367,34 @@ export function EchoApp() {
     prevNoteCountRef.current = notes.length;
   }, [notes, scrollToBottomToken]);
 
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        document.querySelector<HTMLInputElement>('input[type="search"]')?.focus();
+      }
+    };
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, []);
+
   const filteredNotes = useMemo(() => {
     return notes.filter((note) => {
-      const matchesView = !note.isArchived;
+      const matchesView = activeView === "archived"
+        ? note.isArchived
+        : activeView === "starred"
+          ? note.isStarred && !note.isArchived
+          : !note.isArchived;
       const matchesFolder = activeFolderId === "all" || note.folderId === activeFolderId;
       const matchesTag = activeTagId === "all" || note.tags.some((tag) => tag.id === activeTagId);
-      return matchesView && matchesFolder && matchesTag;
+      const query = searchQuery.trim().toLocaleLowerCase();
+      const matchesSearch = !query
+        || note.content.toLocaleLowerCase().includes(query)
+        || note.fileName?.toLocaleLowerCase().includes(query)
+        || note.tags.some((tag) => tag.name.toLocaleLowerCase().includes(query));
+      return matchesView && matchesFolder && matchesTag && matchesSearch;
     });
-  }, [activeFolderId, activeTagId, notes]);
+  }, [activeFolderId, activeTagId, activeView, notes, searchQuery]);
 
   const actions = createEchoActions({
     notes,
@@ -468,8 +491,26 @@ export function EchoApp() {
   } = actions;
 
   return (
-    <div className="flex h-[var(--app-height,100dvh)] flex-col overflow-hidden bg-[#f5f5f5] text-neutral-950">
-      <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col gap-4 px-4 py-4 sm:px-6">
+    <div className="flex h-[var(--app-height,100dvh)] flex-col overflow-hidden bg-[var(--canvas)] text-[var(--ink)]">
+      <div className="mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col overflow-hidden border-x border-[var(--line)] bg-[var(--surface)] shadow-[0_20px_80px_rgba(15,23,42,0.06)]">
+        <EchoHeader
+          view={activeView}
+          searchQuery={searchQuery}
+          noteCount={filteredNotes.length}
+          onChangeView={setActiveView}
+          onChangeSearch={setSearchQuery}
+          onOpenSidebar={() => setIsSidebarOpen(true)}
+        />
+        {error ? (
+          <div className="mx-4 mt-3 flex items-center justify-between gap-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 sm:mx-6" role="alert">
+            <span className="min-w-0">{error}</span>
+            <button className="shrink-0 font-semibold hover:underline" type="button" onClick={() => void fetchAppData(true)}>重试</button>
+          </div>
+        ) : notice ? (
+          <div className="mx-4 mt-3 rounded-xl border border-[var(--line)] bg-[var(--surface-raised)] px-3 py-2 text-sm text-[var(--muted)] sm:mx-6" role="status">
+            {notice}
+          </div>
+        ) : null}
         <EchoSidebar
           isOpen={isSidebarOpen}
           error={error}
@@ -532,6 +573,8 @@ export function EchoApp() {
           folders={folders}
           isLoading={isLoading}
           filteredNotes={filteredNotes}
+          view={activeView}
+          searchQuery={searchQuery}
           noteActionId={noteActionId}
           editingNoteId={editingNoteId}
           editingContent={editingContent}

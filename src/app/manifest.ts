@@ -4,11 +4,11 @@ export default function manifest(): MetadataRoute.Manifest {
   return {
     name: "Echo",
     short_name: "Echo",
-    description: "一个黑白极简的跨设备消息同步与整理工具",
+    description: "私人跨设备信息收件箱与 AI 检索助手",
     start_url: "/",
     display: "standalone",
-    background_color: "#f5f5f5",
-    theme_color: "#f5f5f5",
+    background_color: "#eef1f4",
+    theme_color: "#ffffff",
     share_target: {
       action: "/share",
       method: "POST",

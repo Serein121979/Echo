@@ -1,6 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  outputFileTracingRoot: process.cwd(),
   allowedDevOrigins: ["172.25.116.60", "172.20.10.3", "localhost", "127.0.0.1"],
 };
 

@@ -1,4 +1,4 @@
-import { createClient } from "@supabase/supabase-js";
+import { createBrowserClient } from "@supabase/ssr";
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -21,7 +21,7 @@ function isConfiguredKey(value?: string) {
 // The app currently uses Supabase without generated database types.
 // Keep the client wide enough for inserts/updates until typed schema is added.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-type SupabaseClientAny = ReturnType<typeof createClient<any>>;
+type SupabaseClientAny = ReturnType<typeof createBrowserClient<any>>;
 
 let cachedClient: SupabaseClientAny | null = null;
 
@@ -40,12 +40,6 @@ export function getSupabaseClient() {
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  cachedClient = createClient<any>(supabaseUrl!, supabaseAnonKey!, {
-    auth: {
-      persistSession: true,
-      autoRefreshToken: true,
-      detectSessionInUrl: true,
-    },
-  });
+  cachedClient = createBrowserClient<any>(supabaseUrl!, supabaseAnonKey!);
   return cachedClient;
 }

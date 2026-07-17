@@ -1,6 +1,7 @@
 import "./style.css";
 
 import { defaultWindowIcon } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
 import { Menu } from "@tauri-apps/api/menu";
 import type { TrayIconEvent } from "@tauri-apps/api/tray";
 import { TrayIcon } from "@tauri-apps/api/tray";
@@ -11,14 +12,16 @@ import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { load } from "@tauri-apps/plugin-store";
+import * as tus from "tus-js-client";
 
-const STORE_PATH = "clips-store.json";
+const STORE_PATH = "echo-store.json";
 const STORE_KEY = "appState";
 const RECENT_LIMIT = 100;
 const MAX_SYNC_BYTES = 200 * 1024;
 const CLIPBOARD_POLL_MS = 1200;
 const DEDUPE_WINDOW_MS = 10_000;
 const IGNORE_WINDOW_MS = 15_000;
+const MAX_FILE_SIZE = 500 * 1024 * 1024;
 
 type ClipKind = "text" | "code";
 
@@ -67,6 +70,18 @@ type BannerState = {
 const env = import.meta.env as Record<string, string | undefined>;
 const supabaseUrl = env.VITE_SUPABASE_URL ?? env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey = env.VITE_SUPABASE_ANON_KEY ?? env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+const secureAuthStorage = {
+  getItem(key: string) {
+    return invoke<string | null>("secure_storage_get", { key });
+  },
+  setItem(key: string, value: string) {
+    return invoke<void>("secure_storage_set", { key, value });
+  },
+  removeItem(key: string) {
+    return invoke<void>("secure_storage_remove", { key });
+  },
+};
 
 const root = (() => {
   const value = document.querySelector<HTMLDivElement>("#app");
@@ -179,11 +194,11 @@ function mapClipRecord(row: Record<string, unknown>): ClipRecord {
   return {
     id: String(row.id),
     content: typeof row.content === "string" ? row.content : "",
-    kind: row.kind === "code" ? "code" : "text",
-    contentHash: typeof row.content_hash === "string" ? row.content_hash : "",
+    kind: detectKind(typeof row.content === "string" ? row.content : ""),
+    contentHash: "",
     sourceDeviceId: typeof row.source_device_id === "string" ? row.source_device_id : "",
     sourcePlatform: typeof row.source_platform === "string" ? row.source_platform : "",
-    isPinned: Boolean(row.is_pinned),
+    isPinned: Boolean(row.is_starred),
     createdAt: typeof row.created_at === "string" ? row.created_at : new Date().toISOString(),
   };
 }
@@ -204,6 +219,9 @@ let notificationGranted = false;
 let knownClipIds = new Set<string>();
 let isQuitting = false;
 let realtimeChannel: { unsubscribe: () => Promise<unknown> } | null = null;
+let registeredDeviceId: string | null = null;
+let pendingClipboard: PendingClip | null = null;
+let pendingClipboardTimer: number | null = null;
 
 function setStatus(tone: BannerTone, message: string) {
   statusBanner = { tone, message };
@@ -274,11 +292,11 @@ function renderLoginView() {
     <div class="shell">
       <div class="frame">
         <section class="hero">
-          <p class="eyebrow">Echo Clips Desktop</p>
+          <p class="eyebrow">Echo Desktop</p>
           <div class="title-row">
             <div>
               <h1>让剪切板常驻在线</h1>
-              <p class="hero-subtitle">桌面端会自动监听纯文本和代码片段，同步到你的个人 Clips 流。</p>
+              <p class="hero-subtitle">桌面端检测到新的剪切板内容后会先询问，确认后才同步到你的私人 Echo。</p>
             </div>
             <span class="status-pill neutral">未登录</span>
           </div>
@@ -293,7 +311,7 @@ function renderLoginView() {
               <div class="title-row">
                 <div>
                   <h2>使用同一个 Supabase 账号登录</h2>
-                  <p class="panel-subtitle">桌面端和 Web 端共享同一条 Clips 私有数据流，RLS 会按用户隔离。</p>
+                  <p class="panel-subtitle">桌面端和 Web 端共享同一条 Echo 私有数据流，RLS 会按用户隔离。</p>
                 </div>
               </div>
             </div>
@@ -321,7 +339,7 @@ function renderAppView() {
     <div class="shell">
       <div class="frame">
         <section class="hero">
-          <p class="eyebrow">Echo Clips Desktop</p>
+          <p class="eyebrow">Echo Desktop</p>
           <div class="title-row">
             <div>
               <h1>托盘常驻的小面板</h1>
@@ -349,14 +367,17 @@ function renderAppView() {
           </div>
           <div class="action-row">
             <button class="button" data-action="send-current-clipboard">发送当前剪切板</button>
+            <button class="button-secondary" data-action="choose-files">发送文件</button>
             <button class="button-secondary" data-action="flush-queue">重试离线队列</button>
             <button class="button-secondary" data-action="refresh-clips">刷新列表</button>
             <button class="button-danger" data-action="sign-out">退出当前设备登录</button>
           </div>
+          <input id="desktop-file-input" type="file" multiple hidden />
+          ${pendingClipboard ? `<div class="status-banner warning"><strong>发送刚复制的内容？</strong><p>${escapeHtml(pendingClipboard.content.slice(0, 120))}</p><div class="action-row"><button class="button" data-action="confirm-clipboard">发送</button><button class="button-secondary" data-action="ignore-clipboard">忽略</button></div></div>` : ""}
           <div class="toggle-row">
             <label class="toggle">
               <input id="monitor-toggle" type="checkbox" ${persistedState.settings.monitorClipboard ? "checked" : ""} />
-              自动监听剪切板
+              检测剪切板并询问
             </label>
             <label class="toggle">
               <input id="autostart-toggle" type="checkbox" ${persistedState.settings.autostartEnabled ? "checked" : ""} />
@@ -396,7 +417,7 @@ function renderAppView() {
             </div>
             <span class="counter">${recentClips.length} 条</span>
           </div>
-          ${renderClipList(recentClips, "最近还没有同步记录。复制一段文本或代码，桌面端就会开始写入 Clips。")}
+          ${renderClipList(recentClips, "最近还没有同步记录。复制一段文本或代码，确认后就会进入 Echo。")}
         </section>
       </div>
     </div>
@@ -410,7 +431,7 @@ function render() {
 async function syncTrayTooltip() {
   if (!trayIcon) return;
 
-  const prefix = currentSession ? "Echo Clips 已登录" : "Echo Clips 未登录";
+  const prefix = currentSession ? "Echo 已登录" : "Echo 未登录";
   await trayIcon.setTooltip(`${prefix} · ${statusBanner.message}`);
 }
 
@@ -421,7 +442,7 @@ async function saveAndRender() {
 }
 
 async function ensureStore() {
-  store = await load(STORE_PATH, { autoSave: false });
+  store = await load(STORE_PATH, { autoSave: false, defaults: {} });
   const saved = await store.get<PersistedState>(STORE_KEY);
   if (saved) {
     persistedState = {
@@ -462,7 +483,7 @@ async function notifyNewClip(clip: ClipRecord) {
   }
 
   sendNotification({
-    title: "Echo Clips",
+    title: "Echo",
     body: clip.kind === "code" ? "收到一段新的代码片段，点击面板即可复制。" : "收到一条新的文本片段，点击面板即可复制。",
   });
 }
@@ -526,16 +547,16 @@ async function setupTray() {
 
   let icon;
   try {
-    icon = await defaultWindowIcon();
+    icon = (await defaultWindowIcon()) ?? undefined;
   } catch {
     icon = undefined;
   }
 
   trayIcon = await TrayIcon.new({
-    id: "echo-clips-tray",
+    id: "echo-tray",
     menu,
     icon,
-    tooltip: "Echo Clips",
+    tooltip: "Echo",
     iconAsTemplate: true,
     menuOnLeftClick: false,
     action: (event: TrayIconEvent) => {
@@ -558,14 +579,14 @@ async function fetchClipBuckets() {
 
   const buildQuery = () =>
     client
-      .from("clips")
-      .select("id, content, kind, content_hash, source_device_id, source_platform, is_pinned, created_at")
+      .from("notes")
+      .select("id, content, source_device_id, source_platform, is_starred, created_at")
       .eq("user_id", session.user.id)
       .is("deleted_at", null);
 
   const [pinnedResult, recentResult] = await Promise.all([
-    buildQuery().eq("is_pinned", true).order("created_at", { ascending: false }),
-    buildQuery().eq("is_pinned", false).order("created_at", { ascending: false }).limit(RECENT_LIMIT),
+    buildQuery().eq("is_starred", true).order("created_at", { ascending: false }),
+    buildQuery().eq("is_starred", false).eq("is_archived", false).order("created_at", { ascending: false }).limit(RECENT_LIMIT),
   ]);
 
   if (pinnedResult.error) {
@@ -603,12 +624,12 @@ async function refreshClips(silent = false) {
       .at(-1) ?? persistedState.settings.lastSeenTimestamp;
     await saveState();
     if (!silent) {
-      setStatus("success", "Clips 已刷新完成。");
+      setStatus("success", "Echo 已刷新完成。");
     } else {
       render();
     }
   } catch (error) {
-    setStatus("danger", getErrorMessage(error, "Clips 刷新失败。"));
+    setStatus("danger", getErrorMessage(error, "Echo 刷新失败。"));
   }
 }
 
@@ -623,13 +644,13 @@ async function subscribeToRealtime() {
   }
 
   realtimeChannel = supabase
-    .channel(`clips-${currentSession.user.id}`)
+    .channel(`echo-${currentSession.user.id}`)
     .on(
       "postgres_changes",
       {
         event: "*",
         schema: "public",
-        table: "clips",
+        table: "notes",
         filter: `user_id=eq.${currentSession.user.id}`,
       },
       (payload: { eventType?: string; new?: Record<string, unknown> }) => {
@@ -639,7 +660,7 @@ async function subscribeToRealtime() {
           nextRow &&
           typeof nextRow.id === "string" &&
           !knownClipIds.has(nextRow.id) &&
-          nextRow.source_device_id !== persistedState.deviceId
+          nextRow.source_device_id !== registeredDeviceId
         ) {
           void notifyNewClip(mapClipRecord(nextRow));
         }
@@ -671,10 +692,22 @@ async function initializeSession() {
 }
 
 async function handleSignedIn() {
+  if (supabase && currentSession) {
+    const { data, error } = await supabase.from("devices").upsert({
+      user_id: currentSession.user.id,
+      client_id: persistedState.deviceId,
+      name: `${detectPlatform()} 桌面端`,
+      platform: detectPlatform(),
+      last_seen_at: new Date().toISOString(),
+    }, { onConflict: "user_id,client_id" }).select("id").single();
+    if (error) throw error;
+    registeredDeviceId = data.id;
+    await supabase.rpc("bootstrap_echo_user");
+  }
   await refreshClips(true);
   await subscribeToRealtime();
   await flushPendingQueue();
-  setStatus("success", "桌面端已接入你的 Clips 数据流。");
+  setStatus("success", "桌面端已接入你的 Echo 数据流。");
 }
 
 async function setupAuth() {
@@ -737,7 +770,24 @@ async function pollClipboard() {
   }
 
   lastObservedClipboard = nextText;
-  await processClipboardContent(nextText, false);
+  await proposeClipboardContent(nextText);
+}
+
+async function proposeClipboardContent(content: string) {
+  if (!content.trim()) return;
+  const byteLength = new TextEncoder().encode(content).length;
+  if (byteLength > MAX_SYNC_BYTES) return setStatus("warning", "剪切板内容超过 200 KB，未进入发送确认。");
+  const hash = await sha256(content);
+  if (hasTimedHash(persistedState.ignoredHashes, hash) || hasTimedHash(persistedState.recentUploads, hash)) return;
+  pendingClipboard = { content, kind: detectKind(content), hash, createdAt: new Date().toISOString() };
+  if (pendingClipboardTimer) window.clearTimeout(pendingClipboardTimer);
+  pendingClipboardTimer = window.setTimeout(() => {
+    if (pendingClipboard) void markIgnoredHash(pendingClipboard.hash);
+    pendingClipboard = null;
+    render();
+  }, 8000);
+  if (notificationGranted) sendNotification({ title: "Echo", body: "检测到新的剪切板内容，打开 Echo 确认是否发送。" });
+  setStatus("warning", "检测到新的剪切板内容，8 秒内确认后才会发送。");
 }
 
 async function queueClip(clip: PendingClip) {
@@ -758,12 +808,11 @@ async function sendClip(clip: PendingClip, queueOnFailure: boolean) {
   }
 
   try {
-    const { error } = await supabase.from("clips").insert([
+    const { error } = await supabase.from("notes").insert([
       {
+        user_id: currentSession.user.id,
         content: clip.content,
-        kind: clip.kind,
-        content_hash: clip.hash,
-        source_device_id: persistedState.deviceId,
+        source_device_id: registeredDeviceId,
         source_platform: detectPlatform(),
       },
     ]);
@@ -830,6 +879,49 @@ async function sendCurrentClipboard() {
   await processClipboardContent(clipboard, true);
 }
 
+function uploadDesktopFile(file: File, objectName: string) {
+  return new Promise<void>((resolve, reject) => {
+    if (!currentSession || !supabaseUrl) return reject(new Error("当前设备未登录"));
+    const upload = new tus.Upload(file, {
+      endpoint: `${supabaseUrl}/storage/v1/upload/resumable`,
+      headers: { authorization: `Bearer ${currentSession.access_token}`, "x-upsert": "false" },
+      retryDelays: [0, 1000, 3000, 5000, 10000],
+      chunkSize: 6 * 1024 * 1024,
+      uploadDataDuringCreation: true,
+      removeFingerprintOnSuccess: true,
+      metadata: { bucketName: "echo-files", objectName, contentType: file.type || "application/octet-stream", cacheControl: "3600" },
+      onProgress: (sent, total) => setStatus("neutral", `正在上传 ${file.name} · ${total ? Math.round(sent / total * 100) : 0}%`),
+      onError: reject,
+      onSuccess: () => resolve(),
+    });
+    upload.findPreviousUploads().then((previous) => {
+      if (previous[0]) upload.resumeFromPreviousUpload(previous[0]);
+      upload.start();
+    }).catch(reject);
+  });
+}
+
+async function sendDesktopFiles(files: File[]) {
+  if (!supabase || !currentSession || files.length === 0) return;
+  const oversized = files.find((file) => file.size > MAX_FILE_SIZE);
+  if (oversized) return setStatus("warning", `“${oversized.name}”超过 500MB 上限。`);
+  try {
+    const { data: note, error } = await supabase.from("notes").insert({ user_id: currentSession.user.id, content: "", source_device_id: registeredDeviceId, source_platform: detectPlatform() }).select("id").single();
+    if (error) throw error;
+    for (const file of files) {
+      const suffix = file.name.includes(".") ? `.${file.name.split(".").pop()}` : "";
+      const objectName = `${currentSession.user.id}/${new Date().toISOString().slice(0, 10)}/${crypto.randomUUID()}${suffix}`;
+      await uploadDesktopFile(file, objectName);
+      const { error: attachmentError } = await supabase.from("attachments").insert({ user_id: currentSession.user.id, note_id: note.id, storage_path: objectName, file_name: file.name, file_type: file.type || "application/octet-stream", file_size: file.size });
+      if (attachmentError) throw attachmentError;
+    }
+    setStatus("success", `${files.length} 个文件已发送到 Echo。`);
+    await refreshClips(true);
+  } catch (error) {
+    setStatus("danger", getErrorMessage(error, "文件发送失败。"));
+  }
+}
+
 async function flushPendingQueue() {
   if (!currentSession || persistedState.pendingQueue.length === 0) {
     return;
@@ -867,7 +959,7 @@ async function markIgnoredHash(hash: string) {
 async function copyClipToLocalClipboard(clipId: string) {
   const clip = getClipById(clipId);
   if (!clip) {
-    setStatus("danger", "找不到要复制的那条 Clips。");
+    setStatus("danger", "找不到要复制的那条消息。");
     return;
   }
 
@@ -894,14 +986,14 @@ async function mutateClip(clipId: string, payload: Record<string, unknown>, succ
   render();
 
   try {
-    const { error } = await supabase.from("clips").update(payload).eq("id", clipId);
+    const { error } = await supabase.from("notes").update(payload).eq("id", clipId).eq("user_id", currentSession?.user.id);
     if (error) {
       throw error;
     }
 
     setStatus("success", successMessage);
   } catch (error) {
-    setStatus("danger", getErrorMessage(error, "更新 Clips 失败。"));
+    setStatus("danger", getErrorMessage(error, "更新 Echo 消息失败。"));
   } finally {
     busyActionIds.delete(clipId);
     render();
@@ -909,11 +1001,11 @@ async function mutateClip(clipId: string, payload: Record<string, unknown>, succ
 }
 
 async function togglePin(clipId: string, nextPinned: boolean) {
-  await mutateClip(clipId, { is_pinned: nextPinned }, nextPinned ? "这条 Clips 已置顶。" : "这条 Clips 已取消置顶。");
+  await mutateClip(clipId, { is_starred: nextPinned }, nextPinned ? "这条消息已收藏。" : "这条消息已取消收藏。");
 }
 
 async function deleteClip(clipId: string) {
-  await mutateClip(clipId, { deleted_at: new Date().toISOString() }, "这条 Clips 已从列表中移除。");
+  await mutateClip(clipId, { deleted_at: new Date().toISOString() }, "这条消息已从列表中移除。");
 }
 
 async function handleLoginFormSubmit(form: HTMLFormElement) {
@@ -939,7 +1031,7 @@ async function handleLoginFormSubmit(form: HTMLFormElement) {
     }
 
     authDraft.password = "";
-    setStatus("success", "登录成功，正在接入你的 Clips 数据流。");
+    setStatus("success", "登录成功，正在接入你的 Echo 数据流。");
   } catch (error) {
     setStatus("danger", getErrorMessage(error, "登录失败，请检查邮箱和密码。"));
   }
@@ -980,6 +1072,12 @@ function attachDomEvents() {
   root.addEventListener("change", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement)) {
+      return;
+    }
+
+    if (target.id === "desktop-file-input") {
+      void sendDesktopFiles(Array.from(target.files ?? []));
+      target.value = "";
       return;
     }
 
@@ -1038,6 +1136,29 @@ function attachDomEvents() {
       return;
     }
 
+    if (action === "choose-files") {
+      root.querySelector<HTMLInputElement>("#desktop-file-input")?.click();
+      return;
+    }
+
+    if (action === "confirm-clipboard" && pendingClipboard) {
+      const clip = pendingClipboard;
+      pendingClipboard = null;
+      if (pendingClipboardTimer) window.clearTimeout(pendingClipboardTimer);
+      void sendClip(clip, true);
+      render();
+      return;
+    }
+
+    if (action === "ignore-clipboard" && pendingClipboard) {
+      const clip = pendingClipboard;
+      pendingClipboard = null;
+      if (pendingClipboardTimer) window.clearTimeout(pendingClipboardTimer);
+      void markIgnoredHash(clip.hash);
+      setStatus("neutral", "这次复制已忽略，不会上传。");
+      return;
+    }
+
     if (action === "flush-queue") {
       void flushPendingQueue();
       return;
@@ -1065,9 +1186,10 @@ async function initSupabase() {
 
   supabase = createClient(supabaseUrl!, supabaseAnonKey!, {
     auth: {
+      storage: secureAuthStorage,
       persistSession: true,
       autoRefreshToken: true,
-      detectSessionInUrl: true,
+      detectSessionInUrl: false,
     },
   });
 
